@@ -3,128 +3,34 @@
 import { useState, useEffect } from "react";
 import Link from "next/link";
 import { CARRIER_NAMES, carrierName } from "../lib/carriers";
+import type {
+  CapacityCorrelationResult,
+  Coefficient,
+  Lever,
+  LeverResult,
+  NetworkResilienceResult,
+  RankingEntry,
+  RankingResult,
+  RiskResult,
+  ScenarioCell,
+  ScenarioResult,
+} from "./types";
+import {
+  COMPONENT_LABELS,
+  FEATURE_LABELS,
+  PREDECESSOR_COLS,
+  COST_MODEL_LABELS,
+  DecisionTab,
+  METRIC_LABELS,
+  TAB_METHOD_ANCHORS,
+  TAB_HELP,
+  TURNAROUND_ROWS,
+} from "./constants";
+import { useMode } from "../lib/mode";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 
 const CARRIER_CODES = Object.keys(CARRIER_NAMES);
-
-const COMPONENT_LABELS: Record<string, string> = {
-  reliability: "Reliability",
-  delay_severity: "Delay severity",
-  severe_delay_exposure: "Severe-delay exposure",
-  cancellation_resilience: "Cancellation resilience",
-  diversion_resilience: "Diversion resilience",
-};
-
-const FEATURE_LABELS: Record<string, string> = {
-  severe_delay_rate: "Severe-delay rate",
-  cancellation_rate: "Cancellation rate",
-  average_departure_delay: "Avg departure delay",
-  late_aircraft_delay_share: "Late-aircraft delay share",
-  ground_delay_share: "Ground-time share",
-  log_flight_volume: "Flight volume (log)",
-  trend_severe_delay_rate: "Recent trend (vs. last 3 months)",
-  seasonal_index: "Seasonal pattern (this calendar month, historically)",
-};
-
-type Lever = {
-  component: string;
-  current_value: number;
-  network_median: number;
-  weight: number;
-  hypothetical_score_if_at_median: number;
-  point_gain: number;
-};
-
-type LeverResult = {
-  carrier: string;
-  current_score: number;
-  current_rating: string;
-  peer_count: number;
-  levers: Lever[];
-};
-
-type ScenarioCell = {
-  turnaround_bucket: string;
-  predecessor_bucket: string;
-  pairs: number;
-  avg_successor_dep_delay: number;
-};
-
-type ScenarioResult = {
-  carrier: string | null;
-  tight_turnaround_minutes: number;
-  target_turnaround_minutes: number;
-  cells: ScenarioCell[];
-};
-
-type RankingEntry = {
-  carrier: string;
-  current_score: number;
-  current_rating: string;
-  total_flights: number;
-  top_lever_component: string;
-  top_lever_current_value: number;
-  top_lever_network_median: number;
-  top_lever_point_gain: number;
-};
-
-type RankingResult = {
-  peer_count: number;
-  carriers: RankingEntry[];
-};
-
-type CalibrationBin = {
-  probability_band: string;
-  count: number;
-  mean_predicted_probability: number;
-  observed_risk_rate: number;
-};
-
-type Metrics = {
-  examples: number;
-  positive_rate: number;
-  brier_score: number;
-  log_loss: number;
-  precision_recall_auc: number;
-  calibration_bins: CalibrationBin[];
-};
-
-type Coefficient = {
-  feature: string;
-  standardized_coefficient: number;
-  direction: "higher_risk" | "lower_risk";
-};
-
-type CentralityEntry = { airport: string; value: number };
-
-type NetworkResilienceResult = {
-  scope: { minimum_flights_per_route: number; airport_count: number; route_count: number };
-  degree_centrality: { top_by_route_count: CentralityEntry[]; top_by_flight_volume: CentralityEntry[] };
-  betweenness_centrality: { top_structural_bridges: CentralityEntry[] };
-  methodology: { combination_policy: string; limitations: string[] };
-};
-
-type RiskResult = {
-  entity_type: string;
-  entity: string;
-  as_of_period: string;
-  risk_probability: number;
-  risk_band: string;
-  risk_threshold_definition: string;
-  current_features: Record<string, number>;
-  model_coefficients: Coefficient[];
-  split: {
-    train_end: string; validation_end: string;
-    train_examples: number; validation_examples: number; test_examples: number;
-  };
-  validation_metrics: Metrics;
-  test_metrics: Metrics;
-  entities_in_training_panel: number;
-};
-
-const TURNAROUND_ROWS = ["Tight", "Normal", "Loose"];
-const PREDECESSOR_COLS = ["On time or early", "Late (1-60 min)", "Very late (60+ min)"];
 
 function scoreColor(score: number): string {
   if (score >= 80) return "#4f9d8f";
@@ -181,15 +87,16 @@ function deriveRankingVerdict(result: RankingResult): string | null {
   const topVolume = topThree.reduce((a, b) => (b.total_flights > a.total_flights ? b : a));
 
   if (topGain.carrier === topVolume.carrier) {
-    return `${carrierName(topGain.carrier)} has both the largest single-component opportunity in the network (+${topGain.top_lever_point_gain.toFixed(1)} points via ${COMPONENT_LABELS[topGain.top_lever_component]}) and the highest flight volume among the top three by gain -- the clearest starting point of these three, on this measure alone.`;
+    return `${carrierName(topGain.carrier)} is the clearest starting point among the first three: it has the largest possible score change (+${topGain.top_lever_point_gain.toFixed(1)} via ${COMPONENT_LABELS[topGain.top_lever_component]}) and the most flights affected.`;
   }
 
   const ratio = topVolume.total_flights / topGain.total_flights;
-  return `${carrierName(topGain.carrier)} has the largest single-component opportunity (+${topGain.top_lever_point_gain.toFixed(1)} points via ${COMPONENT_LABELS[topGain.top_lever_component]}), but only ${topGain.total_flights.toLocaleString()} flights behind it. ${carrierName(topVolume.carrier)}'s smaller gap (+${topVolume.top_lever_point_gain.toFixed(1)} points) touches ${topVolume.total_flights.toLocaleString()} flights -- ${ratio.toFixed(1)}x more. Which matters more depends on whether you're optimizing for the cleanest fix or the widest reach, which this can't decide for you.`;
+  return `The largest possible score change is with ${carrierName(topGain.carrier)} (+${topGain.top_lever_point_gain.toFixed(1)} via ${COMPONENT_LABELS[topGain.top_lever_component]}). ${carrierName(topVolume.carrier)} reaches ${topVolume.total_flights.toLocaleString()} flights among the first three — ${ratio.toFixed(1)}x more — so this page shows both size of change and reach for you to weigh.`;
 }
 
 export default function DecisionCenterPage() {
-  const [tab, setTab] = useState<"levers" | "scenario" | "ranking" | "risk" | "bank" | "portfolio" | "resilience">("levers");
+  const { mode, setMode } = useMode();
+  const [tab, setTab] = useState<DecisionTab>("levers");
   const [carrierInput, setCarrierInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [notFound, setNotFound] = useState(false);
@@ -210,6 +117,7 @@ export default function DecisionCenterPage() {
   const [bankWindowStart, setBankWindowStart] = useState(6);
   const [bankWindowEnd, setBankWindowEnd] = useState(10);
   const [bankShift, setBankShift] = useState(30);
+  const [bankMaxMoved, setBankMaxMoved] = useState<number | null>(null);
   const [bankMode, setBankMode] = useState<"expected" | "risk_averse">("expected");
   const [bankSeasonalYears, setBankSeasonalYears] = useState(3);
   const [bankResult, setBankResult] = useState<any>(null);
@@ -217,10 +125,13 @@ export default function DecisionCenterPage() {
   const [portfolioType, setPortfolioType] = useState<"carrier" | "airport">("carrier");
   const [portfolioBudgetInput, setPortfolioBudgetInput] = useState(3);
   const [portfolioMetric, setPortfolioMetric] = useState("severe_delay_exposure");
+  const [portfolioCostModel, setPortfolioCostModel] = useState("unit");
   const [portfolioResult, setPortfolioResult] = useState<any>(null);
 
   const [resilienceMinFlights, setResilienceMinFlights] = useState(50);
   const [resilienceResult, setResilienceResult] = useState<NetworkResilienceResult | null>(null);
+  const [capacityCarrier, setCapacityCarrier] = useState("");
+  const [capacityResult, setCapacityResult] = useState<CapacityCorrelationResult | null>(null);
 
   useEffect(() => {
     if ((riskEntityType === "airport" || tab === "bank") && airportOptions.length === 0) {
@@ -239,6 +150,7 @@ export default function DecisionCenterPage() {
     setBankResult(null);
     setPortfolioResult(null);
     setResilienceResult(null);
+    setCapacityResult(null);
     setNotFound(false);
     setError(false);
   }
@@ -278,6 +190,7 @@ export default function DecisionCenterPage() {
           seasonal_lookback_years: String(bankSeasonalYears),
         });
         if (bankCarrier) params.set("carrier", bankCarrier);
+        if (bankMaxMoved !== null) params.set("max_moved_flights", String(bankMaxMoved));
         const res = await fetch(`${API_BASE}/api/decision/departure-bank-smoothing?${params}`);
         if (res.status === 404) { setBankResult(null); setNotFound(true); return; }
         if (!res.ok) throw new Error("not ok");
@@ -285,6 +198,7 @@ export default function DecisionCenterPage() {
       } else if (tab === "portfolio") {
         const params = new URLSearchParams({
           candidate_type: portfolioType, budget: String(portfolioBudgetInput), primary_metric: portfolioMetric,
+          cost_model: portfolioCostModel,
         });
         const res = await fetch(`${API_BASE}/api/decision/network-protection-portfolio?${params}`);
         if (!res.ok) throw new Error("not ok");
@@ -293,6 +207,12 @@ export default function DecisionCenterPage() {
         const res = await fetch(`${API_BASE}/api/decision/network-resilience?minimum_flights=${resilienceMinFlights}`);
         if (!res.ok) throw new Error("not ok");
         setResilienceResult(await res.json());
+      } else if (tab === "capacity") {
+        const params = new URLSearchParams({ limit: "30", minimum_flights: "100" });
+        if (capacityCarrier) params.set("carrier", capacityCarrier);
+        const res = await fetch(`${API_BASE}/api/capacity/correlation?${params}`);
+        if (!res.ok) throw new Error("not ok");
+        setCapacityResult(await res.json());
       } else {
         const res = await fetch(`${API_BASE}/api/decision/opportunity-ranking`);
         if (!res.ok) throw new Error("not ok");
@@ -313,16 +233,47 @@ export default function DecisionCenterPage() {
     );
   }
 
+  if (mode === "public") {
+    return (
+      <main className="page researcher-gate">
+        <section className="researcher-gate-card">
+          <p className="eyebrow">Research workspace</p>
+          <h1 className="title">Decision Center is where the questions become tests.</h1>
+          <p className="subtitle">
+            The public brief is designed to explain the network quickly. This workspace is for comparing carriers,
+            checking next-month risk, testing bounded schedule changes, and connecting T-100 traffic with on-time outcomes.
+          </p>
+          <div className="researcher-gate-actions">
+            <button type="button" className="primary-action" onClick={() => setMode("researcher")}>Open researcher workspace <span>→</span></button>
+            <Link href="/methodology#decision-center-methodology" className="secondary-action">Read the method first</Link>
+          </div>
+          <p className="page-note">You can switch back to the public brief at any time from the navigation.</p>
+        </section>
+      </main>
+    );
+  }
+
   return (
-    <main className="page">
+    <main className="page decision-center-page surface-page surface-researcher">
       <header className="header">
         <p className="eyebrow">DOT On-Time Performance &middot; Decision Center</p>
         <h1 className="title">Decision Center</h1>
         <p className="subtitle">
-          Built entirely on relationships already calibrated or measured elsewhere on this site
-          (see <Link href="/methodology">Methodology</Link>) &mdash; not new predictive models.
+          Simple questions on real flight data. <Link href="/methodology#decision-center-methodology">See the methodology</Link> for the full math.
         </p>
       </header>
+
+      <section className="decision-guide" aria-label="How to read the Decision Center">
+        <div>
+          <span className="decision-guide-title">Decision Center in simple words</span>
+          <span className="decision-guide-copy">Pick a question → choose a few settings → read the answer.</span>
+        </div>
+        <div className="decision-guide-legend">
+          <span><b>Look back</b> what happened</span>
+          <span><b>Look ahead</b> what may happen</span>
+          <span><b>Try a change</b> what could improve</span>
+        </div>
+      </section>
 
       <div className="sort-toggle" style={{ marginBottom: "1.5rem" }}>
         <button
@@ -330,54 +281,72 @@ export default function DecisionCenterPage() {
           className={tab === "levers" ? "sort-toggle-active" : ""}
           onClick={() => { setTab("levers"); resetResults(); }}
         >
-          Health Score Levers
+          {TAB_HELP.levers.label}
         </button>
         <button
           type="button"
           className={tab === "scenario" ? "sort-toggle-active" : ""}
           onClick={() => { setTab("scenario"); resetResults(); }}
         >
-          Turnaround Scenarios
+          {TAB_HELP.scenario.label}
         </button>
         <button
           type="button"
           className={tab === "ranking" ? "sort-toggle-active" : ""}
           onClick={() => { setTab("ranking"); resetResults(); }}
         >
-          Network Opportunity Ranking
+          {TAB_HELP.ranking.label}
         </button>
         <button
           type="button"
           className={tab === "risk" ? "sort-toggle-active" : ""}
           onClick={() => { setTab("risk"); resetResults(); }}
         >
-          Predictive Risk Screen
+          {TAB_HELP.risk.label}
         </button>
         <button
           type="button"
           className={tab === "bank" ? "sort-toggle-active" : ""}
           onClick={() => { setTab("bank"); resetResults(); }}
         >
-          Departure Bank Smoothing
+          {TAB_HELP.bank.label}
         </button>
         <button
           type="button"
           className={tab === "portfolio" ? "sort-toggle-active" : ""}
           onClick={() => { setTab("portfolio"); resetResults(); }}
         >
-          Network Protection Portfolio
+          {TAB_HELP.portfolio.label}
         </button>
         <button
           type="button"
           className={tab === "resilience" ? "sort-toggle-active" : ""}
           onClick={() => { setTab("resilience"); resetResults(); }}
         >
-          Network Resilience Ranking
+          {TAB_HELP.resilience.label}
+        </button>
+        <button
+          type="button"
+          className={tab === "capacity" ? "sort-toggle-active" : ""}
+          onClick={() => { setTab("capacity"); resetResults(); }}
+        >
+          {TAB_HELP.capacity.label}
         </button>
       </div>
 
       <section className="section" style={{ marginTop: 0 }}>
         <div className="screen">
+          <p className="page-note" style={{ marginBottom: "0.75rem" }}>
+            <strong>Question:</strong> {TAB_HELP[tab].question}
+          </p>
+          <div className="decision-simple-help">
+            <div><span>YOU CHOOSE</span>{TAB_HELP[tab].choose}</div>
+            <div><span>YOU GET</span>{TAB_HELP[tab].result}</div>
+          </div>
+          <p className="page-note" style={{ marginTop: "0.75rem" }}>
+            <Link href={`/methodology#${TAB_METHOD_ANCHORS[tab]}`}>Open the full methodology</Link> if you want the detailed method.
+          </p>
+          <div style={{ display: "none" }}>
           {tab === "levers" && (
             <>
               <p className="page-note" style={{ marginBottom: "1rem" }}>
@@ -477,8 +446,9 @@ export default function DecisionCenterPage() {
                 <strong>What this is:</strong> if you can only focus resources on a few
                 carriers or airports, which ones give the most real coverage for the budget? A
                 real 0/1 knapsack optimization &mdash; pick the metric that matters to you
-                (severe-delay exposure, cancellation resilience, volume, etc.), and it selects the
-                best-value combination under your budget. Every OTHER metric is still reported for
+                (severe-delay exposure, cancellation resilience, or volume), choose how resource
+                cost should scale, and it selects the best-value combination under your budget.
+                Every OTHER metric is still reported for
                 whatever gets selected, so nothing is hidden inside one invented priority score.
               </p>
               <p className="page-note" style={{ marginBottom: "1rem" }}>
@@ -508,6 +478,7 @@ export default function DecisionCenterPage() {
               </p>
             </>
           )}
+          </div>
 
           {(tab === "levers" || tab === "scenario") && (
             <div className="route-lookup-row">
@@ -543,7 +514,7 @@ export default function DecisionCenterPage() {
           {tab === "risk" && (
             <div className="route-lookup-row">
               <label className="filter-field">
-                <span className="filter-label">Entity type</span>
+                <span className="filter-label">Who to check</span>
                 <select
                   value={riskEntityType}
                   onChange={(e) => { setRiskEntityType(e.target.value as "carrier" | "airport"); setRiskEntity(""); }}
@@ -553,9 +524,9 @@ export default function DecisionCenterPage() {
                 </select>
               </label>
               <label className="filter-field">
-                <span className="filter-label">{riskEntityType === "carrier" ? "Carrier" : "Airport"}</span>
+                <span className="filter-label">{riskEntityType === "carrier" ? "Choose an airline" : "Choose an airport"}</span>
                 <select value={riskEntity} onChange={(e) => setRiskEntity(e.target.value)}>
-                  <option value="">Select {riskEntityType}</option>
+                  <option value="">Select one</option>
                   {riskEntityType === "carrier"
                     ? CARRIER_CODES.map((code) => (
                         <option key={code} value={code}>{code} &mdash; {carrierName(code)}</option>
@@ -569,7 +540,7 @@ export default function DecisionCenterPage() {
                 onClick={analyze}
                 disabled={!riskEntity || loading}
               >
-                {loading ? "Training model..." : "Screen risk"}
+                  {loading ? "Checking..." : "Check next month"}
               </button>
             </div>
           )}
@@ -584,7 +555,7 @@ export default function DecisionCenterPage() {
                 </select>
               </label>
               <label className="filter-field">
-                <span className="filter-label">Carrier (optional)</span>
+                <span className="filter-label">Airline (optional)</span>
                 <select value={bankCarrier} onChange={(e) => setBankCarrier(e.target.value)}>
                   <option value="">All carriers</option>
                   {CARRIER_CODES.map((code) => (
@@ -593,19 +564,19 @@ export default function DecisionCenterPage() {
                 </select>
               </label>
               <label className="filter-field">
-                <span className="filter-label">Window start (hour)</span>
+                <span className="filter-label">Busy period starts</span>
                 <select value={bankWindowStart} onChange={(e) => setBankWindowStart(Number(e.target.value))}>
                   {Array.from({ length: 24 }, (_, h) => <option key={h} value={h}>{h}:00</option>)}
                 </select>
               </label>
               <label className="filter-field">
-                <span className="filter-label">Window end (hour)</span>
+                <span className="filter-label">Busy period ends</span>
                 <select value={bankWindowEnd} onChange={(e) => setBankWindowEnd(Number(e.target.value))}>
                   {Array.from({ length: 24 }, (_, h) => <option key={h} value={h}>{h}:00</option>)}
                 </select>
               </label>
               <label className="filter-field">
-                <span className="filter-label">Allowed shift</span>
+                <span className="filter-label">Move flights by at most</span>
                 <select value={bankShift} onChange={(e) => setBankShift(Number(e.target.value))}>
                   <option value={15}>&plusmn;15 min</option>
                   <option value={30}>&plusmn;30 min</option>
@@ -613,16 +584,27 @@ export default function DecisionCenterPage() {
                 </select>
               </label>
               <label className="filter-field">
-                <span className="filter-label">Mode</span>
+                <span className="filter-label">Maximum flights to move</span>
+                <input
+                  type="number"
+                  min={0}
+                  value={bankMaxMoved ?? ""}
+                  placeholder="No cap"
+                  onChange={(e) => setBankMaxMoved(e.target.value === "" ? null : Number(e.target.value))}
+                  style={{ width: "6rem" }}
+                />
+              </label>
+              <label className="filter-field">
+                <span className="filter-label">How cautious?</span>
                 <select value={bankMode} onChange={(e) => setBankMode(e.target.value as "expected" | "risk_averse")}>
-                  <option value="expected">Expected</option>
-                  <option value="risk_averse">Risk-averse (CVaR)</option>
+                  <option value="expected">Use the average result</option>
+                  <option value="risk_averse">Be more cautious</option>
                 </select>
               </label>
               <label className="filter-field">
-                <span className="filter-label">Seasonal baseline</span>
+                <span className="filter-label">Compare with previous years</span>
                 <select value={bankSeasonalYears} onChange={(e) => setBankSeasonalYears(Number(e.target.value))}>
-                  <option value={0}>Off (this window only)</option>
+                  <option value={0}>No — this window only</option>
                   <option value={1}>1 prior year</option>
                   <option value={3}>3 prior years</option>
                   <option value={5}>5 prior years</option>
@@ -634,7 +616,7 @@ export default function DecisionCenterPage() {
                 onClick={analyze}
                 disabled={!bankAirport || loading}
               >
-                {loading ? "Solving..." : "Optimize this bank"}
+                  {loading ? "Trying..." : "Try the change"}
               </button>
             </div>
           )}
@@ -642,14 +624,14 @@ export default function DecisionCenterPage() {
           {tab === "portfolio" && (
             <div className="route-lookup-row">
               <label className="filter-field">
-                <span className="filter-label">Candidate type</span>
+                <span className="filter-label">Focus on</span>
                 <select value={portfolioType} onChange={(e) => setPortfolioType(e.target.value as "carrier" | "airport")}>
                   <option value="carrier">Carrier</option>
                   <option value="airport">Airport</option>
                 </select>
               </label>
               <label className="filter-field">
-                <span className="filter-label">Budget (# of interventions)</span>
+                <span className="filter-label">Number of targets</span>
                 <input
                   type="number" min={1} max={20} value={portfolioBudgetInput}
                   onChange={(e) => setPortfolioBudgetInput(Number(e.target.value))}
@@ -657,18 +639,21 @@ export default function DecisionCenterPage() {
                 />
               </label>
               <label className="filter-field">
-                <span className="filter-label">Optimize for</span>
+                <span className="filter-label">Attention per target</span>
+                <select value={portfolioCostModel} onChange={(e) => setPortfolioCostModel(e.target.value)}>
+                  <option value="unit">Equal attention per target</option>
+                  <option value="flight_volume_millions">Flight-volume exposure</option>
+                  <option value="sqrt_flight_volume">Square-root volume proxy</option>
+                </select>
+              </label>
+              <label className="filter-field">
+                <span className="filter-label">Main goal</span>
                 <select value={portfolioMetric} onChange={(e) => setPortfolioMetric(e.target.value)}>
-                  <option value="severe_delay_exposure">Severe-delay exposure</option>
-                  <option value="reliability">Reliability</option>
-                  <option value="delay_severity">Delay severity</option>
-                  <option value="cancellation_resilience">Cancellation resilience</option>
-                  <option value="diversion_resilience">Diversion resilience</option>
-                  <option value="total_flights_millions">Total flight volume</option>
+                  {Object.entries(METRIC_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
                 </select>
               </label>
               <button type="button" className="compare-run" onClick={analyze} disabled={loading}>
-                {loading ? "Solving..." : "Build portfolio"}
+                {loading ? "Choosing..." : "Choose focus areas"}
               </button>
             </div>
           )}
@@ -676,7 +661,7 @@ export default function DecisionCenterPage() {
           {tab === "resilience" && (
             <div className="route-lookup-row">
               <label className="filter-field">
-                <span className="filter-label">Minimum flights per route</span>
+                <span className="filter-label">Ignore routes with fewer than</span>
                 <input
                   type="number" min={1} max={5000} value={resilienceMinFlights}
                   onChange={(e) => setResilienceMinFlights(Number(e.target.value))}
@@ -684,10 +669,32 @@ export default function DecisionCenterPage() {
                 />
               </label>
               <button type="button" className="compare-run" onClick={analyze} disabled={loading}>
-                {loading ? "Computing..." : "Rank network"}
+                {loading ? "Finding..." : "Find important airports"}
               </button>
             </div>
           )}
+
+          {tab === "capacity" && (
+            <div className="route-lookup-row">
+              <label className="filter-field">
+                <span className="filter-label">Airline (optional)</span>
+                <select value={capacityCarrier} onChange={(e) => setCapacityCarrier(e.target.value)}>
+                  <option value="">All carriers</option>
+                  {CARRIER_CODES.map((code) => (
+                    <option key={code} value={code}>{code} &mdash; {carrierName(code)}</option>
+                  ))}
+                </select>
+              </label>
+              <button type="button" className="compare-run" onClick={analyze} disabled={loading}>
+                {loading ? "Comparing..." : "Compare traffic and on-time"}
+              </button>
+              <Link href="/capacity" className="decision-external-link">Open the full T-100 view →</Link>
+            </div>
+          )}
+
+          <p className="decision-tab-type">
+            <span>{TAB_HELP[tab].kind}</span> {TAB_HELP[tab].result}
+          </p>
 
           {notFound && <p className="error-text" style={{ marginTop: "1rem" }}>No matching flights found for that carrier.</p>}
           {error && <p className="error-text" style={{ marginTop: "1rem" }}>Could not reach the API.</p>}
@@ -704,31 +711,26 @@ export default function DecisionCenterPage() {
                 </span>
                 <div>
                   <div style={{ color: scoreColor(leverResult.current_score), fontWeight: 600 }}>{leverResult.current_rating}</div>
-                  <div className="tile-label">{carrierName(leverResult.carrier)}&apos;s current Health Score, vs. {leverResult.peer_count} peer carriers</div>
+                  <div className="tile-label">{carrierName(leverResult.carrier)}&apos;s current Health Score, vs. {leverResult.peer_count} other airlines</div>
                 </div>
               </div>
 
               {topLever && parseFloat(topLever.point_gain.toFixed(1)) > 0 && (
                 <div className="decision-verdict">
                   <span className="decision-verdict-label">Recommendation</span>
-                  Biggest lever: <strong>{COMPONENT_LABELS[topLever.component]}</strong>. If this
-                  one component matched the network median ({topLever.network_median.toFixed(1)}{" "}
-                  vs. its current {topLever.current_value.toFixed(1)}), the overall score would be{" "}
-                  <strong>{topLever.hypothetical_score_if_at_median.toFixed(1)}</strong> instead
-                  of {leverResult.current_score.toFixed(1)} &mdash; a gain of{" "}
-                  <strong>{topLever.point_gain.toFixed(1)} points</strong>, holding every other
-                  component exactly as it is now. This is the single highest-leverage place to
-                  look first, given the scoring formula &mdash; not a claim it's the easiest to
-                  actually fix.
+                  Start with <strong>{COMPONENT_LABELS[topLever.component]}</strong>. In this
+                  score-based what-if, bringing it to the network&apos;s typical value would change the score from{" "}
+                  <strong>{leverResult.current_score.toFixed(1)}</strong> to{" "}
+                  <strong>{topLever.hypothetical_score_if_at_median.toFixed(1)}</strong> ({" "}
+                  <strong>+{topLever.point_gain.toFixed(1)} points</strong>). It identifies where
+                  to investigate first; it does not promise that the change is easy or causal.
                 </div>
               )}
               {topLever && parseFloat(topLever.point_gain.toFixed(1)) <= 0 && (
                 <div className="decision-verdict">
                   <span className="decision-verdict-label">Recommendation</span>
-                  No single-component lever here. Every component is already at or above the
-                  network median &mdash; this carrier isn&apos;t behind its peers on any one
-                  dimension, so there&apos;s nothing this specific method can point to as an
-                  opportunity.
+                  No single area stands out below the network&apos;s typical value, so this check does
+                  not point to one clear opportunity for this airline.
                 </div>
               )}
             </div>
@@ -736,20 +738,20 @@ export default function DecisionCenterPage() {
 
           <section className="section">
             <div className="section-head">
-              <h2 className="section-title">All five components, ranked by point gain</h2>
+            <h2 className="section-title">All five areas, biggest score changes first</h2>
             </div>
             <div className="screen">
               <div className="rotation-table-wrap">
                 <table className="compare-table">
                   <thead>
                     <tr>
-                      <th>Component</th>
+                      <th>Area</th>
                       <th>Current</th>
-                      <th>Network median</th>
-                      <th>Weight in score</th>
-                      <th>Current points earned</th>
-                      <th>Hypothetical score</th>
-                      <th>Point gain</th>
+                      <th>Network typical</th>
+                      <th>Importance</th>
+                      <th>Current score points</th>
+                      <th>Score if matched</th>
+                      <th>Score change</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -782,9 +784,9 @@ export default function DecisionCenterPage() {
         <section className="section">
           <div className="section-head">
             <h2 className="section-title">
-              Average knock-on departure delay for {carrierName(scenarioResult.carrier ?? "")}
+              What happened to the next flight for {carrierName(scenarioResult.carrier ?? "")}
             </h2>
-            <span className="section-note">minutes, by turnaround tightness x inbound delay</span>
+            <span className="section-note">average minutes late</span>
           </div>
           <div className="screen">
             {(() => {
@@ -801,7 +803,7 @@ export default function DecisionCenterPage() {
               <table className="compare-table">
                 <thead>
                   <tr>
-                    <th>Scheduled turnaround</th>
+                      <th>Planned time before next flight</th>
                     {PREDECESSOR_COLS.map((col) => <th key={col}>{col}</th>)}
                   </tr>
                 </thead>
@@ -838,10 +840,9 @@ export default function DecisionCenterPage() {
               </table>
             </div>
             <p className="page-note" style={{ marginTop: "1rem" }}>
-              Reading this: compare across a row to see how much an inbound delay actually costs
-              the next flight under that turnaround type. Compare down a column to see whether
-              tighter turnarounds actually run worse, given how they were used in practice &mdash;
-              not assuming they would if used differently.
+              Read across a row to see how much a late inbound flight was followed by a late next
+              flight. This describes what happened historically; it does not promise what would
+              happen if schedules were changed.
             </p>
           </div>
         </section>
@@ -850,7 +851,7 @@ export default function DecisionCenterPage() {
       {tab === "ranking" && rankingResult && (
         <section className="section">
           <div className="section-head">
-            <h2 className="section-title">Every carrier&apos;s biggest single lever, ranked</h2>
+            <h2 className="section-title">Where each airline has the clearest gap</h2>
             <span className="section-note">{rankingResult.peer_count} carriers</span>
           </div>
           <div className="screen">
@@ -929,8 +930,8 @@ export default function DecisionCenterPage() {
                             </span>
                           </div>
                           <div className="page-note" style={{ marginTop: "0.25rem" }}>
-                            Biggest lever: <strong>{COMPONENT_LABELS[entry.top_lever_component] ?? entry.top_lever_component}</strong>{" "}
-                            ({entry.top_lever_current_value.toFixed(1)} vs. network median {entry.top_lever_network_median.toFixed(1)})
+                            Largest possible score change: <strong>{COMPONENT_LABELS[entry.top_lever_component] ?? entry.top_lever_component}</strong>{" "}
+                            ({entry.top_lever_current_value.toFixed(1)} vs. network typical {entry.top_lever_network_median.toFixed(1)})
                             &mdash; {entry.total_flights.toLocaleString()} flights in this data.
                           </div>
                         </div>
@@ -940,7 +941,7 @@ export default function DecisionCenterPage() {
                           return (
                             <div className="opportunity-gain" style={{ color: isPositive ? "#4f9d8f" : "#9099a8" }}>
                               {isPositive ? "+" : ""}{rounded}
-                              <span className="tile-label" style={{ display: "block", textAlign: "right" }}>pt gain</span>
+                              <span className="tile-label" style={{ display: "block", textAlign: "right" }}>possible change</span>
                             </div>
                           );
                         })()}
@@ -1000,32 +1001,29 @@ export default function DecisionCenterPage() {
 
           <section className="section">
             <div className="section-head">
-              <h2 className="section-title">Model quality &mdash; check this before trusting the number above</h2>
+              <h2 className="section-title">How much should I trust this estimate?</h2>
             </div>
             <div className="screen">
               <div className="board board-compact">
-                <Tile label="Trained on" value={`${riskResult.entities_in_training_panel} entities`} />
-                <Tile label="Train / val / test examples" value={`${riskResult.split.train_examples} / ${riskResult.split.validation_examples} / ${riskResult.split.test_examples}`} />
-                <Tile label="Test-set PR-AUC" value={riskResult.test_metrics.precision_recall_auc.toFixed(3)} tone={riskResult.test_metrics.precision_recall_auc < 0.55 ? "rust" : undefined} />
-                <Tile label="Test-set positive rate" value={`${(riskResult.test_metrics.positive_rate * 100).toFixed(1)}%`} />
+                <Tile label="Airlines/airports used" value={`${riskResult.entities_in_training_panel}`} />
+                <Tile label="Past examples checked" value={`${riskResult.split.test_examples}`} />
+                <Tile label="Test signal (higher is better)" value={riskResult.test_metrics.precision_recall_auc.toFixed(3)} tone={riskResult.test_metrics.precision_recall_auc < 0.55 ? "rust" : undefined} />
+                <Tile label="Bad-month rate in test" value={`${(riskResult.test_metrics.positive_rate * 100).toFixed(1)}%`} />
               </div>
               <p className="page-note" style={{ marginTop: "0.75rem" }}>
-                PR-AUC compares against the positive rate as a random baseline (
-                {riskResult.test_metrics.positive_rate.toFixed(3)} here) &mdash; the closer this
-                model&apos;s PR-AUC is to that baseline, the less real signal it found. Trained on
-                the date range {riskResult.split.train_end} and earlier; validated through{" "}
-                {riskResult.split.validation_end}; tested only on periods after that &mdash; the
-                test set never touched training or calibration.
+                The model is checked on later examples it did not see while learning. A higher test
+                signal means it separates difficult months better than a random guess. Learning used
+                data through {riskResult.split.train_end}; the final check used only later periods.
               </p>
 
               {riskResult.test_metrics.calibration_bins.length > 0 && (
                 <div style={{ marginTop: "1.25rem" }}>
                   <p className="eyebrow" style={{ marginBottom: "0.75rem" }}>
-                    Calibration: predicted vs. actually-observed risk (test set)
+                    Predicted risk compared with what actually happened
                   </p>
                   <table className="compare-table">
                     <thead>
-                      <tr><th>Predicted band</th><th>Count</th><th>Mean predicted</th><th>Actually observed</th></tr>
+                      <tr><th>Predicted group</th><th>Count</th><th>Average estimate</th><th>Actually observed</th></tr>
                     </thead>
                     <tbody>
                       {riskResult.test_metrics.calibration_bins.map((b) => (
@@ -1039,9 +1037,8 @@ export default function DecisionCenterPage() {
                     </tbody>
                   </table>
                   <p className="page-note" style={{ marginTop: "0.5rem" }}>
-                    If &quot;mean predicted&quot; and &quot;actually observed&quot; are close in every
-                    row, the model&apos;s stated confidence is trustworthy. If they diverge, the
-                    risk_band label above is a rougher signal than it looks.
+                    If the estimate and the observed result are close, the risk label is behaving
+                    sensibly. If they are far apart, treat the label as a rough warning.
                   </p>
                 </div>
               )}
@@ -1054,26 +1051,39 @@ export default function DecisionCenterPage() {
         <section className="section">
           <div className="screen">
             <div className="board board-compact">
-              <Tile label="Original peak load" value={`${bankResult.original_peak_load} flights`} tone={bankResult.original_peak_load > bankResult.optimized_peak_load ? "rust" : undefined} />
-              <Tile label="Optimized peak load" value={`${bankResult.optimized_peak_load} flights`} />
-              <Tile label="Flights moved" value={`${bankResult.flights_moved} of ${bankResult.flights_considered}`} />
-              <Tile label="Avg movement" value={`${bankResult.average_movement_minutes} min`} />
+              <Tile label="Busiest period before" value={`${bankResult.original_peak_load} flights`} tone={bankResult.original_peak_load > bankResult.optimized_peak_load ? "rust" : undefined} />
+              <Tile label="Busiest period after" value={`${bankResult.optimized_peak_load} flights`} />
+              <Tile label="Flights shifted" value={`${bankResult.flights_moved} of ${bankResult.flights_considered}`} />
+              <Tile label="Maximum shifts allowed" value={bankResult.max_moved_flights == null ? "None" : String(bankResult.max_moved_flights)} />
+              <Tile label="Average shift" value={`${bankResult.average_movement_minutes} min`} />
+            </div>
+
+            <div className="decision-verdict" style={{ marginTop: "1rem" }}>
+              <span className="decision-verdict-label">What the optimizer suggests</span>
+              {bankResult.original_peak_load > bankResult.optimized_peak_load ? (
+                <>Under the selected constraints, shifting <strong>{bankResult.flights_moved} flights</strong>
+                could reduce the busiest 15-minute period by <strong>{bankResult.original_peak_load - bankResult.optimized_peak_load} flights</strong>.
+                This is a schedule experiment to investigate, not a guarantee of certified capacity.</>
+              ) : (
+                <>The selected shift limits do not reduce the busiest bucket in this window. That is a useful
+                result: try a different window or constraint before treating schedule shifting as an intervention.</>
+              )}
             </div>
 
             <p className="page-note" style={{ marginTop: "0.75rem" }}>
               Window {bankResult.window} at {bankResult.airport}{bankResult.carrier ? ` (${bankResult.carrier} only)` : " (all carriers)"}
-              , {bankResult.date_range}, {bankResult.mode === "risk_averse" ? "risk-averse (CVaR)" : "expected-value"} mode.
-              Preferred bank limit: {bankResult.preferred_bank_limit} flights/15-min
+              , {bankResult.date_range}, {bankResult.mode === "risk_averse" ? "more cautious" : "average-result"} setting.
+              Suggested busy-period limit: {bankResult.preferred_bank_limit} flights in 15 minutes
               {bankResult.preferred_bank_limit_was_auto_computed
                 ? (bankResult.seasonal_baseline.used
-                    ? " (auto-computed from the seasonal baseline below)"
-                    : " (auto-computed from this window's own average load -- no seasonal baseline available)")
+                    ? " (auto-computed from similar past periods)"
+                    : " (auto-computed from this window's average load -- no similar past periods available)")
                 : " (set by you)"}.
               {bankResult.flight_limit_applied && " Note: the flight count hit the safety cap for this window -- results reflect a truncated sample."}
             </p>
 
             <div className="decision-verdict" style={{ marginTop: "1rem" }}>
-              <span className="decision-verdict-label">Seasonal baseline</span>
+              <span className="decision-verdict-label">Past-year comparison</span>
               <span>
                 {" "}{bankResult.seasonal_baseline.note}
                 {bankResult.seasonal_baseline.used && (
@@ -1089,15 +1099,15 @@ export default function DecisionCenterPage() {
             </div>
 
             <div className="decision-verdict" style={{ marginTop: "1rem" }}>
-              <span className="decision-verdict-label">Objective decomposition</span>
-              <span> Congestion exposure: {bankResult.objective_decomposition.congestion_exposure} &middot; Schedule-shift penalty: {bankResult.objective_decomposition.schedule_shift_penalty}</span>
+              <span className="decision-verdict-label">How the comparison works</span>
+              <span> The tool compares this busy period with similar past periods and balances a smaller peak against how far flights have to move.</span>
             </div>
 
             <div style={{ marginTop: "1.5rem" }}>
-              <p className="eyebrow" style={{ marginBottom: "0.75rem" }}>Bank load, before vs. after</p>
+              <p className="eyebrow" style={{ marginBottom: "0.75rem" }}>Flights in each 15-minute period, before and after</p>
               <table className="compare-table">
                 <thead>
-                  <tr><th>Time</th><th>Original</th><th>Optimized</th></tr>
+                  <tr><th>Time</th><th>Before</th><th>After small shifts</th></tr>
                 </thead>
                 <tbody>
                   {Array.from(new Set([...Object.keys(bankResult.original_bank_load), ...Object.keys(bankResult.optimized_bank_load)]))
@@ -1114,7 +1124,7 @@ export default function DecisionCenterPage() {
             </div>
 
             <p className="page-note" style={{ marginTop: "1rem" }}>
-              {bankResult.methodology.cvar_note ?? bankResult.methodology.congestion_source}
+              Important: this uses historical flight counts as a congestion signal, not an official airport capacity limit.
             </p>
           </div>
         </section>
@@ -1124,21 +1134,35 @@ export default function DecisionCenterPage() {
         <section className="section">
           <div className="screen">
             <div className="board board-compact">
-              <Tile label="Resource consumed" value={`${portfolioResult.resource_consumed} / ${portfolioResult.budget}`} />
-              <Tile label="Selected" value={String(portfolioResult.selected.length)} />
-              <Tile label="Rejected" value={String(portfolioResult.rejected.length)} />
-              <Tile label="Optimized for" value={portfolioResult.primary_metric} />
+              <Tile label="Targets used" value={`${portfolioResult.resource_consumed} / ${portfolioResult.budget}`} />
+              <Tile label="Targets selected" value={String(portfolioResult.selected.length)} />
+              <Tile label="Other options" value={String(portfolioResult.rejected.length)} />
+              <Tile label="Main goal" value={METRIC_LABELS[portfolioResult.primary_metric] ?? portfolioResult.primary_metric} />
+              <Tile label="Attention rule" value={COST_MODEL_LABELS[portfolioResult.cost_model] ?? portfolioResult.cost_model} />
             </div>
-            {portfolioResult.primary_metric_note && (
-              <p className="page-note" style={{ marginTop: "0.75rem" }}>{portfolioResult.primary_metric_note}</p>
-            )}
+            <p className="page-note" style={{ marginTop: "0.75rem" }}>
+              The tool picks the combination with the most {METRIC_LABELS[portfolioResult.primary_metric] ?? "of the selected measure"}
+              while staying within the number of targets you allowed.
+            </p>
+
+            <div className="decision-verdict" style={{ marginTop: "1rem" }}>
+              <span className="decision-verdict-label">What this gives you</span>
+              {portfolioResult.selected.length > 0 ? (
+                <>A short list of <strong>{portfolioResult.selected.length} target{portfolioResult.selected.length === 1 ? "" : "s"}</strong>
+                that best fit the selected budget and objective. Use it to decide where to look first;
+                the historical metrics do not predict the size of an intervention&apos;s effect.</>
+              ) : (
+                <>No candidate fits the current budget and constraints. Increase the budget or change the
+                objective to see a different feasible shortlist.</>
+              )}
+            </div>
 
             <div style={{ marginTop: "1.5rem" }}>
-              <p className="eyebrow" style={{ marginBottom: "0.75rem" }}>Selected portfolio</p>
+              <p className="eyebrow" style={{ marginBottom: "0.75rem" }}>Suggested focus areas</p>
               {portfolioResult.selected.map((s: any) => (
                 <div key={s.candidate_id} className="decision-verdict" style={{ marginBottom: "0.6rem" }}>
                   <span className="decision-verdict-label">
-                    {s.candidate_type === "carrier" ? carrierName(s.candidate_id) : s.candidate_id} &mdash; marginal gain {s.marginal_gain}
+                    Focus on {s.candidate_type === "carrier" ? carrierName(s.candidate_id) : s.candidate_id}
                   </span>
                   <span>{s.reason}</span>
                 </div>
@@ -1146,9 +1170,9 @@ export default function DecisionCenterPage() {
             </div>
 
             <div style={{ marginTop: "1.5rem" }}>
-              <p className="eyebrow" style={{ marginBottom: "0.75rem" }}>Total coverage of the selected portfolio (every metric, not just the one optimized)</p>
+              <p className="eyebrow" style={{ marginBottom: "0.75rem" }}>Other measures for these focus areas</p>
               <table className="compare-table">
-                <thead><tr><th>Metric</th><th>Selected total</th><th>Residual (not selected)</th></tr></thead>
+                <thead><tr><th>Measure</th><th>Selected targets</th><th>Targets not selected</th></tr></thead>
                 <tbody>
                   {Object.keys(portfolioResult.total_coverage).map((k) => (
                     <tr key={k}>
@@ -1163,7 +1187,7 @@ export default function DecisionCenterPage() {
 
             {portfolioResult.rejected.length > 0 && (
               <div style={{ marginTop: "1.5rem" }}>
-                <p className="eyebrow" style={{ marginBottom: "0.75rem" }}>Rejected alternatives</p>
+                <p className="eyebrow" style={{ marginBottom: "0.75rem" }}>Other options</p>
                 <table className="compare-table">
                   <thead><tr><th>Candidate</th><th>Reason</th></tr></thead>
                   <tbody>
@@ -1178,7 +1202,9 @@ export default function DecisionCenterPage() {
               </div>
             )}
 
-            <p className="page-note" style={{ marginTop: "1rem" }}>{portfolioResult.methodology.combination_policy}</p>
+            <p className="page-note" style={{ marginTop: "1rem" }}>
+              This is a shortlist based on historical measures. It does not guarantee the size of an intervention&apos;s effect.
+            </p>
           </div>
         </section>
       )}
@@ -1187,17 +1213,26 @@ export default function DecisionCenterPage() {
         <section className="section">
           <div className="screen">
             <div className="board board-compact">
-              <Tile label="Airports in graph" value={String(resilienceResult.scope.airport_count)} />
-              <Tile label="Routes in graph" value={String(resilienceResult.scope.route_count)} />
-              <Tile label="Min flights/route" value={String(resilienceResult.scope.minimum_flights_per_route)} />
+              <Tile label="Airports included" value={String(resilienceResult.scope.airport_count)} />
+              <Tile label="Routes included" value={String(resilienceResult.scope.route_count)} />
+              <Tile label="Minimum route size" value={String(resilienceResult.scope.minimum_flights_per_route)} />
             </div>
+
+            {resilienceResult.betweenness_centrality.top_structural_bridges[0] && (
+              <div className="decision-verdict" style={{ marginTop: "1rem" }}>
+                <span className="decision-verdict-label">What this reveals</span>
+                <strong>{resilienceResult.betweenness_centrality.top_structural_bridges[0].airport}</strong> is the
+                top connector in this view. This is different from busiest: it highlights an airport that links
+                otherwise separate parts of the network.
+              </div>
+            )}
 
             <div style={{ marginTop: "1.5rem" }}>
               <p className="eyebrow" style={{ marginBottom: "0.75rem" }}>
-                Top structural bridges (betweenness centrality)
+                Airports that connect different parts of the network
               </p>
               <table className="compare-table">
-                <thead><tr><th>Airport</th><th>Betweenness</th></tr></thead>
+                <thead><tr><th>Airport</th><th>Connection score</th></tr></thead>
                 <tbody>
                   {resilienceResult.betweenness_centrality.top_structural_bridges.map((e) => (
                     <tr key={e.airport}><td>{e.airport}</td><td>{e.value}</td></tr>
@@ -1235,8 +1270,83 @@ export default function DecisionCenterPage() {
           </div>
         </section>
       )}
+
+      {tab === "capacity" && capacityResult && (
+        <section className="section">
+          <div className="section-head">
+            <h2 className="section-title">T-100 traffic beside on-time performance</h2>
+            <span className="section-note">matched route-months</span>
+          </div>
+          <div className="screen">
+            <div className="board board-compact">
+              <Tile label="Matched route-months" value={capacityResult.overview.matched_route_months.toLocaleString()} />
+              <Tile label="Average seats filled" value={formatPercent(capacityResult.overview.average_load_factor)} />
+              <Tile label="Average on-time rate" value={formatPercent(capacityResult.overview.average_on_time_rate)} />
+              <Tile label="Traffic relationship" value={formatCorrelation(capacityResult.overview.correlation_load_factor_on_time)} />
+            </div>
+
+            <p className="page-note" style={{ marginTop: "1rem" }}>
+              <strong>Simple read:</strong> {describeCapacityRelationship(capacityResult.overview.correlation_load_factor_on_time)}
+              This is a clue to investigate, not proof that fuller flights cause delays.
+            </p>
+            <p className="page-note" style={{ marginTop: "0.5rem" }}>
+              Passengers relationship: <strong>{formatCorrelation(capacityResult.overview.correlation_passengers_on_time)}</strong>
+              {" · "}Seats relationship: <strong>{formatCorrelation(capacityResult.overview.correlation_seats_on_time)}</strong>
+            </p>
+
+            {capacityResult.rows.length > 0 ? (
+              <div className="rotation-table-wrap" style={{ marginTop: "1.25rem" }}>
+                <table className="compare-table">
+                  <thead>
+                    <tr>
+                      <th>Month</th><th>Route</th><th>Flights compared</th><th>Seats</th>
+                      <th>Passengers</th><th>Seats filled</th><th>On-time</th><th>Avg delay</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {capacityResult.rows.map((row) => (
+                      <tr key={`${row.year}-${row.month}-${row.carrier}-${row.origin}-${row.dest}`}>
+                        <td>{`${row.year}-${String(row.month).padStart(2, "0")}`}</td>
+                        <td>{row.origin} → {row.dest}</td>
+                        <td>{row.otp_flights.toLocaleString()}</td>
+                        <td>{row.seats_available.toLocaleString()}</td>
+                        <td>{row.passengers.toLocaleString()}</td>
+                        <td>{formatPercent(row.load_factor)}</td>
+                        <td>{formatPercent(row.on_time_rate)}</td>
+                        <td>{row.avg_arrival_delay == null ? "—" : `${row.avg_arrival_delay.toFixed(1)} min`}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <p className="page-note">No route-months matched both datasets at the selected evidence threshold.</p>
+            )}
+
+            <p className="page-note" style={{ marginTop: "1rem" }}>
+              {capacityResult.source}. {capacityResult.methodology.join_policy}
+            </p>
+          </div>
+        </section>
+      )}
     </main>
   );
+}
+
+function formatPercent(value: number | null, digits = 1): string {
+  return value == null ? "—" : `${(value * 100).toFixed(digits)}%`;
+}
+
+function formatCorrelation(value: number | null): string {
+  return value == null ? "—" : value.toFixed(2);
+}
+
+function describeCapacityRelationship(value: number | null): string {
+  if (value == null) return "There is not enough matched data to describe a traffic relationship yet. ";
+  const magnitude = Math.abs(value);
+  if (magnitude < 0.1) return "Traffic and on-time performance barely move together in this snapshot. ";
+  if (value < 0) return "Fuller flights tend to be on time slightly less often in this snapshot. ";
+  return "Fuller flights tend to be on time slightly more often in this snapshot. ";
 }
 
 function Tile({ label, value, tone }: { label: string; value: string; tone?: "rust" }) {

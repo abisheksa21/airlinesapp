@@ -9,7 +9,6 @@ import threading
 from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
 
 from api.rate_limit import rate_limit_copilot
 
@@ -20,7 +19,9 @@ from api.copilot import get_trend as copilot_get_trend
 from api.copilot import compare_carriers as copilot_compare_carriers
 from api.copilot import get_delay_causes as copilot_get_delay_causes
 from api.db import database_path, open_readonly_connection
-from config import PIPELINE_STATE_FILE
+from config import DEFAULT_HEAVY_LOOKBACK_DAYS, DEFAULT_MODEL_LOOKBACK_DAYS, PIPELINE_STATE_FILE
+from api.metrics import COMPLETED_FLIGHT_SQL, ON_TIME_FLAG_SQL
+from api.analytics import airport_list, airport_ranking, carrier_ranking, network_summary, network_trend, route_hour_baseline, route_ranking
 from api import predictive_risk
 from api.health_score import compute_health_score, score_from_row, RAW_STAT_SELECT_EXPRS
 from api.delay_propagation_markov import get_delay_propagation_markov, STATES as MARKOV_STATES
@@ -30,6 +31,8 @@ from api.schedule_padding_trend import get_schedule_padding_trend
 from api.optimization.backend import PublicBackend
 from api.optimization.departure_bank import BankFlight, solve_departure_bank
 from api.optimization.network_protection import InterventionCandidate, solve_portfolio
+from api.schemas import ChatRequest
+from api.security import require_pipeline_admin
 
 app = FastAPI(title="Airline OTP API")
 
@@ -37,7 +40,10 @@ app = FastAPI(title="Airline OTP API")
 # "https://my-app.vercel.app,https://my-app-git-preview.vercel.app"
 # Defaults to local dev only -- a deployed backend MUST set this env var to
 # its real frontend domain(s), or the deployed frontend simply can't call it.
-_cors_origins_raw = os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:3000")
+_cors_origins_raw = os.getenv(
+    "CORS_ALLOWED_ORIGINS",
+    "http://localhost:3000,http://127.0.0.1:3000",
+)
 CORS_ALLOWED_ORIGINS = [origin.strip() for origin in _cors_origins_raw.split(",") if origin.strip()]
 
 app.add_middleware(
@@ -74,7 +80,7 @@ def _run_auto_update_in_background():
         _update_check_running = False
 
 
-@app.post("/api/admin/check-for-updates")
+@app.post("/api/admin/check-for-updates", dependencies=[Depends(require_pipeline_admin)])
 def check_for_updates():
     """Manually triggers pipeline/auto_update.py in a background thread --
     non-blocking, so the request returns immediately rather than tying up
@@ -255,17 +261,22 @@ def opportunity_ranking_endpoint():
 @app.get("/api/decision/network-protection-portfolio")
 def network_protection_portfolio_endpoint(
     candidate_type: str = Query("carrier", description="'carrier' or 'airport'"),
-    budget: float = Query(3.0, description="How many interventions can be afforded, at 1.0 cost each by default"),
+    budget: float = Query(3.0, ge=0, description="Available intervention-resource budget"),
     primary_metric: str = Query(
         "severe_delay_exposure",
         description="Which REAL, disclosed metric to optimize against -- never a blended composite",
     ),
-    airport_candidate_limit: int = Query(30, description="Airports are pre-filtered to the top N by volume before scoring, to keep this interactive"),
+    airport_candidate_limit: int = Query(30, ge=1, le=200, description="Airports are pre-filtered to the top N by volume before scoring, to keep this interactive"),
+    cost_model: str = Query(
+        "unit",
+        pattern="^(unit|flight_volume_millions|sqrt_flight_volume)$",
+        description="How intervention cost is estimated: unit, flight-volume exposure, or square-root volume proxy",
+    ),
+    cost_scale: float = Query(1.0, gt=0, description="Positive multiplier applied to the selected cost model"),
 ):
     """OR Feature 2: given a limited number of interventions, where should
     they go? Optimizes against exactly ONE real metric the caller chooses
-    -- volume, severe_delay_exposure, cancellation_resilience, etc. (any
-    Health Score component, plus total_flights) -- and reports every other
+    -- total_flights_millions or a Health Score component -- and reports every other
     component for the resulting portfolio too, so nothing is hidden inside
     an invented priority score. See api/optimization/network_protection.py
     for the full methodology, including how marginal_gain is computed (a
@@ -273,6 +284,11 @@ def network_protection_portfolio_endpoint(
     approximation)."""
     if candidate_type not in ("carrier", "airport"):
         raise HTTPException(status_code=400, detail="candidate_type must be 'carrier' or 'airport'")
+    if primary_metric not in {"total_flights_millions", *_HEALTH_SCORE_WEIGHTS.keys()}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"primary_metric must be one of: total_flights_millions, {', '.join(_HEALTH_SCORE_WEIGHTS.keys())}",
+        )
     entity_col = "Marketing_Airline_Network" if candidate_type == "carrier" else "Origin"
 
     # One grouped scan over the whole table computes every candidate's raw
@@ -309,15 +325,19 @@ def network_protection_portfolio_endpoint(
             continue
         components = dict(h["component_scores"])  # reliability, delay_severity, severe_delay_exposure, cancellation_resilience, diversion_resilience -- all real, all disclosed
         components["total_flights_millions"] = round(h["sample"]["total_flights"] / 1_000_000, 3)
+        flight_volume_millions = components["total_flights_millions"]
+        if cost_model == "unit":
+            intervention_cost = 1.0
+        elif cost_model == "flight_volume_millions":
+            intervention_cost = max(0.1, flight_volume_millions)
+        else:
+            intervention_cost = max(0.1, flight_volume_millions ** 0.5)
         candidates.append(InterventionCandidate(
-            candidate_id=code, candidate_type=candidate_type, cost=1.0, components=components,
+            candidate_id=code,
+            candidate_type=candidate_type,
+            cost=round(intervention_cost * cost_scale, 3),
+            components=components,
         ))
-
-    if primary_metric not in {"total_flights_millions", *_HEALTH_SCORE_WEIGHTS.keys()}:
-        raise HTTPException(
-            status_code=400,
-            detail=f"primary_metric must be one of: total_flights_millions, {', '.join(_HEALTH_SCORE_WEIGHTS.keys())}",
-        )
 
     # For resilience/reliability-style components, a LOWER score is worse
     # (more real risk) -- the optimizer maximizes primary_metric, so invert
@@ -341,6 +361,8 @@ def network_protection_portfolio_endpoint(
             if inverted_metric_used else None
         ),
         "budget": budget,
+        "cost_model": cost_model,
+        "cost_scale": cost_scale,
         "status": result.status,
         "selected": result.selected,
         "rejected": result.rejected,
@@ -396,7 +418,8 @@ def predictive_risk_endpoint(
 
     with open_readonly_connection() as connection:
         bounds = connection.execute("SELECT MIN(FlightDate), MAX(FlightDate) FROM flights").fetchone()
-    default_start, default_end = str(bounds[0]), str(bounds[1])
+    default_end = str(bounds[1])
+    default_start = str(date.fromisoformat(default_end) - timedelta(days=DEFAULT_MODEL_LOOKBACK_DAYS))
 
     result = predictive_risk.get_predictive_operational_risk(
         entity_type=entity_type,
@@ -418,11 +441,12 @@ def departure_bank_smoothing_endpoint(
     end_date: Optional[str] = Query(None),
     window_start_hour: int = Query(6, ge=0, le=23),
     window_end_hour: int = Query(10, ge=0, le=23),
-    allowed_shift_minutes: int = Query(30, description="+-15/30/45 minutes"),
-    preferred_bank_limit: Optional[float] = Query(None, description="Flights per 15-min bucket before it counts as overloaded; auto-computed from seasonal history if not given"),
+    allowed_shift_minutes: int = Query(30, ge=0, le=180, description="Maximum movement in either direction, in minutes"),
+    preferred_bank_limit: Optional[float] = Query(None, ge=0, description="Flights per 15-min bucket before it counts as overloaded; auto-computed from seasonal history if not given"),
     seasonal_lookback_years: int = Query(3, ge=0, le=8, description="How many prior years of the SAME calendar window to use as the congestion/delay baseline. 0 disables this and falls back to using only the current window's own data (the original, more circular baseline)."),
     congestion_weighting: float = Query(
         5.0,
+        ge=0,
         description=(
             "Weight on the congestion-overload term relative to the delay-proxy term. Empirically "
             "tuned (not guessed): at very low values the delay-proxy term dominates and the solver "
@@ -436,9 +460,10 @@ def departure_bank_smoothing_endpoint(
             "optimized_peak_load staying comfortably under original_peak_load at this default."
         ),
     ),
-    shift_penalty_weight: float = Query(0.05),
+    shift_penalty_weight: float = Query(0.05, ge=0),
     mode: str = Query("expected", description="'expected' or 'risk_averse'"),
-    flight_limit: int = Query(1500, le=3000, description="Safety cap on flights considered -- keeps this interactive. Applied via a random sample of the matching population, not a truncation, so it stays representative even when capped."),
+    flight_limit: int = Query(1500, ge=1, le=3000, description="Safety cap on flights considered -- keeps this interactive. Applied via a random sample of the matching population, not a truncation, so it stays representative even when capped."),
+    max_moved_flights: Optional[int] = Query(None, ge=0, description="Optional hard cap on how many sampled flights the optimizer may move"),
 ):
     """OR Feature 1: can this departure bank be smoothed with minimal
     disruption? Queries real individual flights (not aggregates) in the
@@ -450,6 +475,8 @@ def departure_bank_smoothing_endpoint(
         raise HTTPException(status_code=400, detail="window_end_hour must be after window_start_hour")
     if mode not in ("expected", "risk_averse"):
         raise HTTPException(status_code=400, detail="mode must be 'expected' or 'risk_averse'")
+    if start_date and end_date and start_date > end_date:
+        raise HTTPException(status_code=400, detail="start_date must be on or before end_date")
 
     if not start_date or not end_date:
         with open_readonly_connection() as connection:
@@ -499,6 +526,11 @@ def departure_bank_smoothing_endpoint(
 
     total_matching_flights = rows[0][2]
     rows = [(r[0], r[1]) for r in rows]
+    if max_moved_flights is not None and max_moved_flights > len(rows):
+        raise HTTPException(
+            status_code=400,
+            detail="max_moved_flights cannot exceed the number of flights considered by this request",
+        )
     # If flight_limit truncated the true population, the fetched rows are a
     # SAMPLE, but seasonal_average_load below is computed from the full,
     # uncapped historical population (a separate GROUP BY query, no LIMIT).
@@ -632,6 +664,7 @@ def departure_bank_smoothing_endpoint(
         bucket_delay_point_estimate=point_estimate,
         bucket_delay_scenarios=bucket_scenarios, scenario_probs=scenario_probs,
         congestion_weighting=congestion_weighting, shift_penalty_weight=shift_penalty_weight,
+        max_moved_flights=max_moved_flights,
         mode=mode, backend=PublicBackend(),
     )
 
@@ -645,6 +678,7 @@ def departure_bank_smoothing_endpoint(
         "window": f"{window_start_hour:02d}:00-{window_end_hour:02d}:00",
         "date_range": f"{start_date} to {end_date}",
         "flights_considered": len(flights),
+        "max_moved_flights": max_moved_flights,
         "total_matching_flights": total_matching_flights,
         "flight_limit_applied": len(rows) == flight_limit,
         "sample_fraction": round(sample_fraction, 4),
@@ -694,6 +728,11 @@ def summary_endpoint(
     end_date: Optional[str] = Query(None),
 ):
     """One real, warehouse-backed summary, optionally filtered by carrier and/or date range."""
+    if not carrier and not start_date and not end_date:
+        with open_readonly_connection() as connection:
+            fast_result = network_summary(connection)
+        if fast_result:
+            return fast_result
     result = copilot_get_summary(carrier=carrier, start_date=start_date, end_date=end_date)
     if "error" in result:
         raise HTTPException(status_code=404, detail=result["error"])
@@ -707,6 +746,11 @@ def trend_endpoint(
     end_date: Optional[str] = Query(None),
 ):
     """On-time rate and flight volume by month, optionally filtered by carrier and/or date range."""
+    if not start_date and not end_date:
+        with open_readonly_connection() as connection:
+            fast_result = network_trend(connection, carrier=carrier)
+        if fast_result is not None:
+            return {"months": fast_result}
     result = copilot_get_trend(carrier=carrier, start_date=start_date, end_date=end_date)
     if "error" in result:
         raise HTTPException(status_code=404, detail=result["error"])
@@ -716,6 +760,10 @@ def trend_endpoint(
 @app.get("/api/carriers")
 def carriers_endpoint():
     """On-time rate, avg delay, and cancellation rate per carrier."""
+    with open_readonly_connection() as connection:
+        fast_result = carrier_ranking(connection)
+    if fast_result is not None:
+        return {"carriers": fast_result}
     return copilot_compare_carriers()
 
 
@@ -1663,6 +1711,9 @@ def time_of_day_endpoint(
 def get_busiest_airports(limit: int = 15):
     """Busiest airports by total flight volume (departures + arrivals combined)."""
     with open_readonly_connection() as connection:
+        fast_rows = airport_ranking(connection, limit)
+        if fast_rows is not None:
+            return {"airports": fast_rows}
         rows = connection.execute(
             """
             WITH per_airport AS (
@@ -2297,6 +2348,9 @@ def get_busiest_routes(limit: int = 15):
     """Busiest directional routes (origin -> destination) by flight volume,
     with on-time rate for each route."""
     with open_readonly_connection() as connection:
+        fast_rows = route_ranking(connection, limit)
+        if fast_rows is not None:
+            return {"routes": fast_rows}
         rows = connection.execute(
             """
             SELECT
@@ -2324,6 +2378,9 @@ def list_all_airports():
     """Every distinct airport code that appears as an origin or destination,
     for populating a search/select control (not ranked, just the full set)."""
     with open_readonly_connection() as connection:
+        fast_airports = airport_list(connection)
+        if fast_airports is not None:
+            return {"airports": fast_airports}
         rows = connection.execute(
             """
             SELECT DISTINCT airport FROM (
@@ -2446,6 +2503,140 @@ def route_detail(
         "carriers": [
             {"carrier": r[0], "total_flights": r[1], "on_time_rate": r[2]} for r in carrier_rows
         ],
+    }
+
+
+@app.get("/api/route-forecast")
+def route_forecast(
+    origin: str = Query(...),
+    dest: str = Query(...),
+    carrier: Optional[str] = Query(None),
+    departure_hour: Optional[int] = Query(None, ge=0, le=23),
+):
+    """Return a transparent historical delay baseline for one route scenario.
+
+    This is deliberately not presented as a weather or machine-learning
+    forecast.  It answers the first useful question from the public view:
+    "How have comparable flights performed historically?"  If the most
+    specific route + carrier + departure-hour slice is too small, step back
+    to a larger route slice and disclose that fallback in the response.
+    """
+    origin = origin.upper()
+    dest = dest.upper()
+    carrier = carrier.upper() if carrier else None
+
+    base_clauses = ["Origin = ?", "Dest = ?"]
+    base_params: list = [origin, dest]
+
+    # Try the most specific useful comparison first.  A minimum of 30
+    # completed flights avoids presenting a handful of flights as a stable
+    # expectation while keeping common routes easy to explore.
+    candidates: list[tuple[str, list[str], list]] = []
+    if carrier and departure_hour is not None:
+        candidates.append(("route + airline + departure hour", [*base_clauses, "Marketing_Airline_Network = ?", "CAST(FLOOR(CRSDepTime / 100) AS INTEGER) = ?"], [*base_params, carrier, departure_hour]))
+    if carrier:
+        candidates.append(("route + airline", [*base_clauses, "Marketing_Airline_Network = ?"], [*base_params, carrier]))
+    if departure_hour is not None:
+        candidates.append(("route + departure hour", [*base_clauses, "CAST(FLOOR(CRSDepTime / 100) AS INTEGER) = ?"], [*base_params, departure_hour]))
+    candidates.append(("route", [*base_clauses], [*base_params]))
+
+    result = None
+    matched_scope = "route"
+    with open_readonly_connection() as connection:
+        # The exact, most-specific slice is pre-aggregated during the warehouse
+        # build. Use it when available so the common public-view question does
+        # not rescan the tens-of-millions-row raw table.
+        if carrier and departure_hour is not None:
+            fast = route_hour_baseline(connection, origin, dest, carrier, departure_hour)
+            if fast and fast["completed_flights"] >= 30:
+                result = (
+                    fast["total_flights"], fast["completed_flights"], fast["on_time_rate"],
+                    fast["avg_arrival_delay_minutes"], fast["median_arrival_delay_minutes"],
+                    fast["p90_arrival_delay_minutes"], fast["cancellation_rate"],
+                )
+                matched_scope = "route + airline + departure hour"
+
+        for scope, clauses, params in candidates:
+            if result is not None:
+                break
+            where = " AND ".join(clauses)
+            row = connection.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS total_flights,
+                    COUNT(*) FILTER (WHERE Cancelled = 0 AND ArrDelay IS NOT NULL) AS completed_flights,
+                    AVG(CASE WHEN Cancelled = 0 THEN CASE WHEN ArrDel15 = 0 THEN 1.0 ELSE 0.0 END END) AS on_time_rate,
+                    AVG(CASE WHEN Cancelled = 0 THEN ArrDelay END) AS avg_arrival_delay_minutes,
+                    quantile_cont(ArrDelay, 0.50) FILTER (WHERE Cancelled = 0 AND ArrDelay IS NOT NULL) AS median_arrival_delay_minutes,
+                    quantile_cont(ArrDelay, 0.90) FILTER (WHERE Cancelled = 0 AND ArrDelay IS NOT NULL) AS p90_arrival_delay_minutes,
+                    AVG(Cancelled * 1.0) AS cancellation_rate
+                FROM flights
+                WHERE {where}
+                """,
+                params,
+            ).fetchone()
+            if row and row[0] and row[1] >= 30:
+                result = row
+                matched_scope = scope
+                break
+
+        if result is None:
+            # Return the route-level row when the route exists but all slices
+            # are small; this produces a useful answer with an honest sample
+            # size instead of a misleading 404.
+            where = " AND ".join(base_clauses)
+            result = connection.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS total_flights,
+                    COUNT(*) FILTER (WHERE Cancelled = 0 AND ArrDelay IS NOT NULL) AS completed_flights,
+                    AVG(CASE WHEN Cancelled = 0 THEN CASE WHEN ArrDel15 = 0 THEN 1.0 ELSE 0.0 END END) AS on_time_rate,
+                    AVG(CASE WHEN Cancelled = 0 THEN ArrDelay END) AS avg_arrival_delay_minutes,
+                    quantile_cont(ArrDelay, 0.50) FILTER (WHERE Cancelled = 0 AND ArrDelay IS NOT NULL) AS median_arrival_delay_minutes,
+                    quantile_cont(ArrDelay, 0.90) FILTER (WHERE Cancelled = 0 AND ArrDelay IS NOT NULL) AS p90_arrival_delay_minutes,
+                    AVG(Cancelled * 1.0) AS cancellation_rate
+                FROM flights
+                WHERE {where}
+                """,
+                base_params,
+            ).fetchone()
+
+    if not result or not result[0]:
+        raise HTTPException(status_code=404, detail="No flights found for that route.")
+
+    requested_scope = "route"
+    if carrier and departure_hour is not None:
+        requested_scope = "route + airline + departure hour"
+    elif carrier:
+        requested_scope = "route + airline"
+    elif departure_hour is not None:
+        requested_scope = "route + departure hour"
+
+    completed = int(result[1] or 0)
+    if completed >= 500:
+        confidence = "strong historical sample"
+    elif completed >= 100:
+        confidence = "useful historical sample"
+    else:
+        confidence = "small historical sample"
+
+    return {
+        "origin": origin,
+        "dest": dest,
+        "carrier": carrier,
+        "departure_hour": departure_hour,
+        "requested_scope": requested_scope,
+        "matched_scope": matched_scope,
+        "used_fallback": matched_scope != requested_scope,
+        "total_flights": int(result[0]),
+        "completed_flights": completed,
+        "on_time_rate": result[2],
+        "avg_arrival_delay_minutes": result[3],
+        "median_arrival_delay_minutes": result[4],
+        "p90_arrival_delay_minutes": result[5],
+        "cancellation_rate": result[6],
+        "confidence": confidence,
+        "interpretation": "A historical baseline from comparable BTS flights. It is not a promise and does not yet use weather, live conditions, or a machine-learning model.",
     }
 
 
@@ -2850,6 +3041,328 @@ def data_health():
     }
 
 
+@app.get("/api/data-sources")
+def data_sources():
+    """Expose provenance and availability of non-flight BTS datasets.
+
+    A missing enrichment table is reported as ``not_loaded``. The API never
+    fabricates a fallback value when T-100 or a support table has not been
+    downloaded and validated yet.
+    """
+    from pipeline.bts_sources import DATASETS
+
+    with open_readonly_connection() as connection:
+        manifest_exists = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.tables
+            WHERE table_name = 'bts_dataset_manifest'
+            """
+        ).fetchone()[0]
+        manifest_rows = {}
+        if manifest_exists:
+            manifest_rows = {
+                row[0]: {
+                    "table_name": row[1],
+                    "status": row[2],
+                    "row_count": row[3],
+                    "loaded_at_utc": str(row[4]) if row[4] else None,
+                }
+                for row in connection.execute(
+                    """
+                    SELECT dataset, table_name, status, row_count, loaded_at_utc
+                    FROM bts_dataset_manifest
+                    """
+                ).fetchall()
+            }
+
+    return {
+        "sources": [
+            {
+                "dataset": dataset.key,
+                "label": dataset.label,
+                "description": dataset.description,
+                "grain": dataset.grain,
+                "cadence": dataset.cadence,
+                "source_url": dataset.url,
+                **manifest_rows.get(
+                    dataset.key,
+                    {
+                        "table_name": None,
+                        "status": "not_loaded",
+                        "row_count": 0,
+                        "loaded_at_utc": None,
+                    },
+                ),
+            }
+            for dataset in DATASETS.values()
+        ],
+        "note": "All values are sourced from BTS downloads or explicit derived aggregates; no synthetic enrichment is used.",
+    }
+
+
+@app.get("/api/capacity/summary")
+def capacity_summary(
+    carrier: Optional[str] = Query(None),
+    origin: Optional[str] = Query(None, min_length=3, max_length=3),
+    dest: Optional[str] = Query(None, min_length=3, max_length=3),
+    limit: int = Query(25, ge=1, le=100),
+):
+    """Return real BTS T-100 route-month capacity context when loaded.
+
+    T-100 is aggregated before this endpoint is queried. This avoids the
+    common mistake of attaching a monthly passenger/seat total to every
+    flight row and thereby multiplying the data.
+    """
+    clauses = []
+    params: list = []
+    if carrier:
+        clauses.append("UniqueCarrier = ?")
+        params.append(carrier.upper())
+    if origin:
+        clauses.append("Origin = ?")
+        params.append(origin.upper())
+    if dest:
+        clauses.append("Dest = ?")
+        params.append(dest.upper())
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
+
+    with open_readonly_connection() as connection:
+        exists = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.views
+            WHERE table_name = 'bts_t100_segment_route_month'
+            """
+        ).fetchone()[0]
+        if not exists:
+            raise HTTPException(
+                status_code=503,
+                detail="BTS T-100 Segment is not loaded. Run the BTS enrichment download, clean, and load steps first.",
+            )
+
+        overview = connection.execute(
+            f"""
+            SELECT
+                COUNT(*) AS route_month_rows,
+                SUM(departures_scheduled),
+                SUM(departures_performed),
+                SUM(seats_available),
+                SUM(passengers),
+                MIN(Year),
+                MAX(Year)
+            FROM bts_t100_segment_route_month
+            {where}
+            """,
+            params,
+        ).fetchone()
+        rows = connection.execute(
+            f"""
+            SELECT
+                Year,
+                Month,
+                UniqueCarrier AS carrier,
+                Origin,
+                Dest,
+                departures_scheduled,
+                departures_performed,
+                seats_available,
+                passengers,
+                load_factor,
+                completion_rate,
+                source_rows
+            FROM bts_t100_segment_route_month
+            {where}
+            ORDER BY passengers DESC NULLS LAST, seats_available DESC NULLS LAST
+            LIMIT ?
+            """,
+            [*params, limit],
+        ).fetchall()
+
+    return {
+        "source": "BTS T-100 Domestic Segment",
+        "grain": "carrier + route + month (aircraft/service-class rows aggregated)",
+        "filters": {"carrier": carrier, "origin": origin, "dest": dest},
+        "overview": {
+            "route_month_rows": overview[0],
+            "departures_scheduled": overview[1],
+            "departures_performed": overview[2],
+            "seats_available": overview[3],
+            "passengers": overview[4],
+            "first_year": overview[5],
+            "last_year": overview[6],
+            "load_factor": (
+                overview[4] / overview[3]
+                if overview[3] not in (None, 0) and overview[4] is not None
+                else None
+            ),
+            "completion_rate": (
+                overview[2] / overview[1]
+                if overview[1] not in (None, 0) and overview[2] is not None
+                else None
+            ),
+        },
+        "rows": [
+            {
+                "year": row[0],
+                "month": row[1],
+                "carrier": row[2],
+                "origin": row[3],
+                "dest": row[4],
+                "departures_scheduled": row[5],
+                "departures_performed": row[6],
+                "seats_available": row[7],
+                "passengers": row[8],
+                "load_factor": row[9],
+                "completion_rate": row[10],
+                "source_rows": row[11],
+            }
+            for row in rows
+        ],
+    }
+
+
+@app.get("/api/capacity/correlation")
+def capacity_correlation(
+    carrier: Optional[str] = Query(None),
+    limit: int = Query(30, ge=5, le=100),
+    minimum_flights: int = Query(100, ge=1, le=10000),
+):
+    """Compare T-100 route-month traffic/capacity with OTP at the same grain.
+
+    T-100 is monthly aggregate data, so this endpoint first aggregates the
+    flight-level OTP table to carrier + route + month and then joins the two
+    native-grain datasets. It deliberately does not attach a month's seats or
+    passengers to individual flights. The correlation is an exploratory
+    association, not a causal claim.
+    """
+    carrier_value = carrier.upper().strip() if isinstance(carrier, str) and carrier else None
+    carrier_clause = "AND Marketing_Airline_Network = ?" if carrier_value else ""
+    t100_clause = "WHERE UniqueCarrier = ?" if carrier_value else ""
+    with open_readonly_connection() as connection:
+        exists = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.views
+            WHERE table_name = 'bts_t100_segment_route_month'
+            """
+        ).fetchone()[0]
+        if not exists:
+            raise HTTPException(
+                status_code=503,
+                detail="BTS T-100 Segment is not loaded. Run the BTS enrichment download, clean, and load steps first.",
+            )
+
+        query = f"""
+            WITH otp_route_month AS (
+                SELECT
+                    Marketing_Airline_Network AS carrier,
+                    Origin,
+                    Dest,
+                    YEAR(FlightDate) AS Year,
+                    MONTH(FlightDate) AS Month,
+                    COUNT(*) AS otp_flights,
+                    SUM(CASE WHEN {COMPLETED_FLIGHT_SQL} THEN 1 ELSE 0 END) AS completed_flights,
+                    AVG(CASE WHEN {COMPLETED_FLIGHT_SQL}
+                        THEN CASE WHEN {ON_TIME_FLAG_SQL} THEN 1.0 ELSE 0.0 END END) AS on_time_rate,
+                    AVG(CASE WHEN {COMPLETED_FLIGHT_SQL} THEN ArrDelay END) AS avg_arrival_delay
+                FROM flights
+                WHERE Marketing_Airline_Network IS NOT NULL
+                    {carrier_clause}
+                GROUP BY ALL
+                HAVING COUNT(*) >= ?
+            ), matched AS (
+                SELECT
+                    t.Year,
+                    t.Month,
+                    t.UniqueCarrier AS carrier,
+                    t.Origin,
+                    t.Dest,
+                    t.departures_scheduled,
+                    t.departures_performed,
+                    t.seats_available,
+                    t.passengers,
+                    t.load_factor,
+                    t.completion_rate,
+                    o.otp_flights,
+                    o.completed_flights,
+                    o.on_time_rate,
+                    o.avg_arrival_delay
+                FROM bts_t100_segment_route_month t
+                INNER JOIN otp_route_month o
+                    ON o.carrier = t.UniqueCarrier
+                    AND o.Origin = t.Origin
+                    AND o.Dest = t.Dest
+                    AND o.Year = t.Year
+                    AND o.Month = t.Month
+                {t100_clause}
+            )
+            SELECT * FROM matched
+        """
+        params = [carrier_value, minimum_flights] if carrier_value else [minimum_flights]
+        # The optional carrier predicate appears in the OTP CTE before the
+        # minimum-flight HAVING parameter. The T-100 predicate, when present,
+        # is intentionally appended after that parameter.
+        if carrier_value:
+            params.append(carrier_value)
+        overview = connection.execute(
+            f"""
+            SELECT
+                COUNT(*) AS matched_route_months,
+                AVG(load_factor),
+                AVG(on_time_rate),
+                AVG(avg_arrival_delay),
+                CORR(load_factor, on_time_rate),
+                CORR(passengers, on_time_rate),
+                CORR(seats_available, on_time_rate),
+                MIN(Year * 100 + Month),
+                MAX(Year * 100 + Month)
+            FROM ({query}) matched
+            """,
+            params,
+        ).fetchone()
+        rows = connection.execute(
+            f"""
+            SELECT *
+            FROM ({query}) matched
+            ORDER BY passengers DESC NULLS LAST, Year DESC, Month DESC
+            LIMIT ?
+            """,
+            [*params, limit],
+        ).fetchall()
+
+    row_keys = [
+        "year", "month", "carrier", "origin", "dest", "departures_scheduled",
+        "departures_performed", "seats_available", "passengers", "load_factor",
+        "completion_rate", "otp_flights", "completed_flights", "on_time_rate",
+        "avg_arrival_delay",
+    ]
+    return {
+        "status": "ok" if overview[0] else "no_matching_route_months",
+        "source": "BTS T-100 Domestic Segment + BTS Marketing Carrier On-Time Performance",
+        "grain": "carrier + origin + destination + month",
+        "filters": {"carrier": carrier_value, "minimum_otp_flights": minimum_flights},
+        "overview": {
+            "matched_route_months": overview[0],
+            "average_load_factor": overview[1],
+            "average_on_time_rate": overview[2],
+            "average_arrival_delay": overview[3],
+            "correlation_load_factor_on_time": overview[4],
+            "correlation_passengers_on_time": overview[5],
+            "correlation_seats_on_time": overview[6],
+            "first_period": overview[7],
+            "last_period": overview[8],
+        },
+        "rows": [dict(zip(row_keys, row)) for row in rows],
+        "methodology": {
+            "association": "Pearson correlation across matched route-month observations. Values near +1 move together, values near -1 move oppositely, and values near 0 show weak linear association.",
+            "interpretation": "This does not prove that fuller flights cause delays. Route mix, season, weather, airport congestion, and carrier scheduling can affect both measurements.",
+            "join_policy": "T-100 monthly aggregates are matched to OTP after OTP is aggregated to the same carrier/route/month grain; monthly T-100 values are never copied onto individual flight rows.",
+            "missing_data": "Only matched route-months with at least the requested number of OTP flights are included.",
+        },
+    }
+
+
 @app.get("/api/queue-pressure")
 def queue_pressure_endpoint(
     airport: str = Query(...),
@@ -2857,13 +3370,18 @@ def queue_pressure_endpoint(
     end_date: Optional[str] = Query(None),
     carrier: Optional[str] = Query(None),
 ):
-    """Hourly congestion/queue-pressure profile for one airport. Defaults to
-    the full dataset range if no dates are given, since the underlying
-    capacity estimate needs enough observed days per hour to be meaningful."""
+    """Hourly congestion/queue-pressure profile for one airport.
+
+    Defaults to the trailing configured lookback rather than the entire
+    warehouse. One recent year gives the estimator enough observed days while
+    preventing an accidental full-history scan on every profile load.
+    """
     if not start_date or not end_date:
         with open_readonly_connection() as connection:
             row = connection.execute("SELECT MIN(FlightDate), MAX(FlightDate) FROM flights").fetchone()
-        start_date = start_date or str(row[0])
+        end_value = date.fromisoformat(str(row[1]))
+        default_start = max(date.fromisoformat(str(row[0])), end_value - timedelta(days=DEFAULT_HEAVY_LOOKBACK_DAYS))
+        start_date = start_date or str(default_start)
         end_date = end_date or str(row[1])
 
     try:
@@ -2877,12 +3395,6 @@ def queue_pressure_endpoint(
         raise HTTPException(status_code=404, detail="No departure data found for that airport/date range.")
 
     return result
-
-
-class ChatRequest(BaseModel):
-    message: str
-    history: Optional[list] = None
-    tier: Optional[str] = None
 
 
 @app.get("/api/schedule-padding")
@@ -2987,7 +3499,7 @@ def copilot_chat(request: ChatRequest):
     if not request.message.strip():
         raise HTTPException(status_code=400, detail="message cannot be empty")
     try:
-        return ask_copilot(request.message)
+        return ask_copilot(request.message, tier=request.tier, history=request.history)
     except CopilotError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 

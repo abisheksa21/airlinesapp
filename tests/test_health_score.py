@@ -31,9 +31,12 @@ from api.health_score import (
 def _build_connection(rows: list[tuple]) -> duckdb.DuckDBPyConnection:
     """rows: (Cancelled, Diverted, ArrDelay) tuples, ArrDelay may be None."""
     con = duckdb.connect(":memory:")
-    con.execute("CREATE TABLE flights (Cancelled INTEGER, Diverted INTEGER, ArrDelay DOUBLE)")
+    con.execute("CREATE TABLE flights (Cancelled INTEGER, Diverted INTEGER, ArrDelay DOUBLE, ArrDel15 INTEGER)")
     if rows:
-        con.executemany("INSERT INTO flights VALUES (?, ?, ?)", rows)
+        con.executemany(
+            "INSERT INTO flights VALUES (?, ?, ?, ?)",
+            [(*row, None if row[2] is None else int(row[2] > 15)) for row in rows],
+        )
     return con
 
 

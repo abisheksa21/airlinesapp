@@ -2,8 +2,11 @@
 
 import { useState, useEffect } from "react";
 import Link from "next/link";
+import { formatNumber } from "../lib/format";
 import AirportChart from "../components/AirportChart";
 import DateRangePreset from "../components/DateRangePreset";
+import { useMode } from "../lib/mode";
+import { airportDisplayName } from "../lib/airports";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 
@@ -12,7 +15,7 @@ type Airport = { airport: string; total_flights: number };
 type Summary = {
   total_flights: number;
   on_time_rate: number;
-  avg_arrival_delay_minutes: number;
+  avg_arrival_delay_minutes: number | null;
   cancellation_rate: number;
 };
 
@@ -26,6 +29,7 @@ function buildQuery(params: Record<string, string>): string {
 }
 
 export default function AirportsPage() {
+  const { mode } = useMode();
   const [ranking, setRanking] = useState<{ airports: Airport[] } | null>(null);
   const [allAirports, setAllAirports] = useState<string[]>([]);
 
@@ -78,11 +82,13 @@ export default function AirportsPage() {
   }
 
   return (
-    <main className="page">
+    <main className={`page surface-page ${mode === "researcher" ? "surface-researcher" : ""}`}>
       <header className="header">
-        <p className="eyebrow">DOT On-Time Performance &middot; Airports</p>
+        <p className="eyebrow">DOT On-Time Performance &middot; {mode === "researcher" ? "Research workspace / airports" : "Airports"}</p>
         <h1 className="title">Airports</h1>
-        <p className="subtitle">Overall ranking, or a quick stats check before visiting a full profile.</p>
+        <p className="subtitle">{mode === "researcher"
+          ? "Use volume to find the network hubs, then open an airport profile to inspect its inbound, outbound, delay, and route evidence."
+          : "Find the busiest gateways, then open an airport profile for the story behind the number."}</p>
       </header>
 
       <section className="section">
@@ -94,6 +100,37 @@ export default function AirportsPage() {
           {ranking ? <AirportChart data={ranking.airports} /> : <p className="error-text">Loading...</p>}
         </div>
       </section>
+
+      {mode === "researcher" && ranking && (
+        <section className="section research-evidence-section">
+          <div className="section-head">
+            <h2 className="section-title">Airport evidence table</h2>
+            <span className="section-note">Top 15 by observed flight volume</span>
+          </div>
+          <div className="screen">
+            <p className="page-note research-reading-note">
+              Airport volume is a measure of observed activity, not a certified capacity limit. Use it to locate important network surfaces, then check the profile for the operating pattern around that airport.
+            </p>
+            <div className="rotation-table-wrap">
+              <table className="compare-table research-data-table">
+                <thead>
+                  <tr><th>Airport</th><th>Observed flights</th><th>Why it matters</th><th>Profile</th></tr>
+                </thead>
+                <tbody>
+                  {ranking.airports.map((airport) => (
+                    <tr key={airport.airport}>
+                      <td><strong>{airport.airport}</strong><span className="table-secondary">{airportDisplayName(airport.airport)}</span></td>
+                      <td>{airport.total_flights.toLocaleString()}</td>
+                      <td>{airport.total_flights >= (ranking.airports[0]?.total_flights ?? 0) * 0.65 ? "High-volume hub" : "Important network surface"}</td>
+                      <td><Link href={`/airports/${airport.airport}`} className="table-link">Open →</Link></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+      )}
 
       <section className="section">
         <div className="section-head">
@@ -135,7 +172,7 @@ export default function AirportsPage() {
               <div className="board board-compact">
                 <Tile label="Total flights" value={summary.total_flights.toLocaleString()} />
                 <Tile label="On-time rate" value={`${(summary.on_time_rate * 100).toFixed(1)}%`} />
-                <Tile label="Avg arrival delay" value={`${summary.avg_arrival_delay_minutes.toFixed(1)} min`} tone="rust" />
+                <Tile label="Avg arrival delay" value={`${formatNumber(summary.avg_arrival_delay_minutes)} min`} tone="rust" />
                 <Tile label="Cancellation rate" value={`${(summary.cancellation_rate * 100).toFixed(2)}%`} tone="rust" />
               </div>
 

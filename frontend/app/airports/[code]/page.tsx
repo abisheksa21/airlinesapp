@@ -10,7 +10,9 @@ import DelayCauseChart from "../../components/DelayCauseChart";
 import RouteChart from "../../components/RouteChart";
 import TimeOfDayChart from "../../components/TimeOfDayChart";
 import TurnbackSummary from "../../components/TurnbackSummary";
+import ReferencePanel from "../../components/ReferencePanel";
 import { airportDisplayName } from "../../lib/airports";
+import { getAirportReference } from "../../lib/reference-profiles";
 import { useMode } from "../../lib/mode";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
@@ -32,6 +34,8 @@ function scoreColor(score: number): string {
 
 const RESEARCHER_TABS = ["Health Score", "Trend", "Time & Turnbacks", "Routes"] as const;
 type ResearcherTab = (typeof RESEARCHER_TABS)[number];
+const PUBLIC_TABS = ["Overview", "About", "Performance"] as const;
+type PublicTab = (typeof PUBLIC_TABS)[number];
 
 export default function AirportProfilePage() {
   return (
@@ -56,6 +60,7 @@ function AirportProfilePageInner() {
   const [timeOfDay, setTimeOfDay] = useState<any>(null);
   const [turnback, setTurnback] = useState<any>(null);
   const [tab, setTab] = useState<ResearcherTab>("Health Score");
+  const [publicTab, setPublicTab] = useState<PublicTab>("Overview");
 
   const loadTokenRef = useRef(0);
 
@@ -122,10 +127,11 @@ function AirportProfilePageInner() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const displayName = detail ? airportDisplayName(code, detail.city, detail.state) : code;
+  const displayName = airportDisplayName(code, detail?.city, detail?.state);
+  const reference = getAirportReference(code, detail?.city, detail?.state);
 
   return (
-    <main className="page">
+    <main className={`page entity-profile-page ${mode === "researcher" ? "entity-profile-researcher" : "entity-profile-public"}`}>
       <header className="header">
         <p className="eyebrow">DOT On-Time Performance &middot; Airport Profile</p>
         <h1 className="title">{displayName}</h1>
@@ -139,12 +145,23 @@ function AirportProfilePageInner() {
       {error && <p className="error-text">Could not load this profile &mdash; check the API is running.</p>}
       {!detail && !notFound && !error && <p className="error-text">Loading...</p>}
 
-      {detail && mode === "public" && (
+      {mode === "public" && (
         <section className="section">
-          <div className="screen">
-            <p className="page-note" style={{ marginBottom: "1rem" }}>
-              {detail.city && detail.state ? `${detail.city}, ${detail.state}` : "Location unavailable"} &middot; IATA code: {code}
-            </p>
+          <div className="public-profile-shell">
+            <div className="public-profile-tabs" role="tablist" aria-label="Public airport profile sections">
+              {PUBLIC_TABS.map((item) => <button key={item} type="button" role="tab" aria-selected={publicTab === item} className={publicTab === item ? "active" : ""} onClick={() => setPublicTab(item)}>{item}</button>)}
+            </div>
+
+            {publicTab === "About" && <ReferencePanel profile={reference} />}
+
+            {publicTab !== "About" && !detail && <div className="profile-data-loading"><span className="loading-pulse" /> Loading measured performance for {code}…<small>The reference profile is already available in the About tab.</small></div>}
+
+            {publicTab !== "About" && detail && <>
+              <div className="public-profile-lede">
+                <p className="eyebrow">{publicTab === "Overview" ? "Plain-language read" : "Performance read"}</p>
+                <h2>{publicTab === "Overview" ? `${displayName} in one minute` : `How ${code} is performing`}</h2>
+                <p>{publicTab === "Overview" ? `${detail.city && detail.state ? `${detail.city}, ${detail.state}` : "Location unavailable"}. This page shows how flights moved through the airport in the BTS record.` : "These numbers are calculated from the BTS warehouse for this airport and the full available history."}</p>
+              </div>
 
             <div className="board">
               <div className="tile">
@@ -180,18 +197,12 @@ function AirportProfilePageInner() {
               </div>
             )}
 
-            <p className="page-note" style={{ marginTop: "1.5rem" }}>
-              Want the full breakdown &mdash; trend over time, delay causes, time of day, turnbacks,
-              top routes?
-            </p>
-            <button
-              type="button"
-              className="profile-action-button"
-              style={{ marginTop: "0.6rem" }}
-              onClick={() => setMode("researcher")}
-            >
-              Switch to Researcher mode
-            </button>
+            {publicTab === "Performance" && detail.months?.length > 0 && <div className="public-profile-chart"><TrendChart data={detail.months} /></div>}
+            <div className="public-profile-action-row">
+              <button type="button" className="profile-action-button" onClick={() => setMode("researcher")}>Open researcher workspace →</button>
+              <span className="page-note">Trend, causes, time of day, turnbacks, and routes live there.</span>
+            </div>
+            </>}
           </div>
         </section>
       )}

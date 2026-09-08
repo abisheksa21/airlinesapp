@@ -30,6 +30,7 @@ import numpy as np
 import pandas as pd
 
 from config import DUCKDB_FILE
+from api.metrics import COMPLETED_FLIGHT_SQL, ON_TIME_FLAG_SQL, SEVERE_DELAY_SQL
 
 MIN_FLIGHTS_PER_PERIOD = 100  # only include routes with enough data in both periods
 EARLY_PERIOD_FRACTION = 0.70  # first 70% of the calendar range = "early"
@@ -56,12 +57,12 @@ def main():
             SELECT
                 Origin, Dest,
                 COUNT(*) AS total_flights,
-                AVG(CASE WHEN Cancelled = 0 AND Diverted = 0 AND ArrDelay IS NOT NULL
-                    THEN CASE WHEN ArrDelay <= 15 THEN 1.0 ELSE 0.0 END END) * 100 AS on_time_pct,
-                AVG(CASE WHEN Cancelled = 0 AND Diverted = 0 AND ArrDelay IS NOT NULL
+                AVG(CASE WHEN {COMPLETED_FLIGHT_SQL}
+                    THEN CASE WHEN {ON_TIME_FLAG_SQL} THEN 1.0 ELSE 0.0 END END) * 100 AS on_time_pct,
+                AVG(CASE WHEN {COMPLETED_FLIGHT_SQL}
                     THEN ArrDelay END) AS avg_delay,
-                AVG(CASE WHEN Cancelled = 0 AND Diverted = 0 AND ArrDelay IS NOT NULL
-                    THEN CASE WHEN ArrDelay > 60 THEN 1.0 ELSE 0.0 END END) * 100 AS severe_delay_pct,
+                AVG(CASE WHEN {SEVERE_DELAY_SQL} THEN 1.0
+                    WHEN {COMPLETED_FLIGHT_SQL} THEN 0.0 END) * 100 AS severe_delay_pct,
                 AVG(Cancelled) * 100 AS cancellation_pct,
                 AVG(Diverted) * 100 AS diversion_pct
             FROM flights

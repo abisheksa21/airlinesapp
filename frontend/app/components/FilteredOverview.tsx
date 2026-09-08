@@ -3,6 +3,8 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import FilterBar, { Filters } from "./FilterBar";
 import TrendChart from "./TrendChart";
+import { ApiError, fetchJson } from "../lib/api";
+import { formatNumber } from "../lib/format";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 
@@ -11,7 +13,7 @@ type Summary = {
   start_date: string;
   end_date: string;
   on_time_rate: number;
-  avg_arrival_delay_minutes: number;
+  avg_arrival_delay_minutes: number | null;
   cancellation_rate: number;
 };
 type MonthPoint = { month: string; total_flights: number; on_time_rate: number };
@@ -53,22 +55,18 @@ export default function FilteredOverview({
     setNotFound(false);
     const qs = buildQuery(next);
     try {
-      const [summaryRes, trendRes] = await Promise.all([
-        fetch(`${API_BASE}/api/summary${qs}`, { signal: controller.signal }),
-        fetch(`${API_BASE}/api/trend${qs}`, { signal: controller.signal }),
+      const [summaryData, trendData] = await Promise.all([
+        fetchJson<Summary>(`${API_BASE}/api/summary${qs}`, { signal: controller.signal }),
+        fetchJson<{ months: MonthPoint[] }>(`${API_BASE}/api/trend${qs}`, { signal: controller.signal }),
       ]);
-      if (summaryRes.status === 404) {
-        setNotFound(true);
-        setSummary(null);
-        setTrend(null);
-        return;
-      }
-      const summaryData = await summaryRes.json();
-      const trendData = await trendRes.json();
       setSummary(summaryData);
       setTrend(trendData);
     } catch (err) {
       if ((err as Error).name === "AbortError") return; // superseded by a newer request, ignore
+      if (err instanceof ApiError && err.status === 404) {
+        setSummary(null);
+        setTrend(null);
+      }
       setNotFound(true);
     } finally {
       if (abortRef.current === controller) {
@@ -110,7 +108,7 @@ export default function FilteredOverview({
           <MiniTile label="On-time rate" value={`${(summary.on_time_rate * 100).toFixed(1)}%`} />
           <MiniTile
             label="Avg arrival delay"
-            value={`${summary.avg_arrival_delay_minutes.toFixed(1)} min`}
+            value={`${formatNumber(summary.avg_arrival_delay_minutes)} min`}
             tone="rust"
           />
           <MiniTile

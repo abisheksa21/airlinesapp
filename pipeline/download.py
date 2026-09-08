@@ -4,8 +4,10 @@
 # Run this script, enter a year, walk away — files appear in Data/Raw/
 
 import os
+import re
 import time
 import sys
+import zipfile
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import Select, WebDriverWait
@@ -13,11 +15,12 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service
 from selenium.common.exceptions import UnexpectedAlertPresentException, TimeoutException
 from webdriver_manager.chrome import ChromeDriverManager
+from webdriver_manager.core.driver_cache import DriverCacheManager
 import sys as _sys
 from pathlib import Path as _Path
 _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
 
-from config import RAW_DIR
+from config import BASE_DIR, RAW_DIR
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 
@@ -160,6 +163,11 @@ FIELDS_ALL = [
 DOWNLOAD_WAIT = 180
 
 
+def _matches_period(filename, year, month):
+    """Accept Chrome conflict suffixes such as (1).zip."""
+    return bool(re.search(rf"_{year}_{month}(?: \(\d+\))?\.zip$", filename, re.IGNORECASE))
+
+
 # ── SETUP ─────────────────────────────────────────────────────────────────────
 
 def get_year():
@@ -179,8 +187,12 @@ def check_existing(year):
     os.makedirs(RAW_DIR, exist_ok=True)
     existing, missing = [], []
     for month in range(1, 13):
-        pattern = f"_{year}_{month}.zip"
-        found = any(f.endswith(pattern) for f in os.listdir(RAW_DIR))
+        found = any(
+            _matches_period(f, year, month) and validate_download_file(
+                os.path.join(RAW_DIR, f), expected_year=year, expected_month=month
+            )
+            for f in os.listdir(RAW_DIR)
+        )
         if found:
             existing.append(month)
         else:
@@ -198,8 +210,19 @@ def setup_driver():
         "safebrowsing.enabled": True,
     }
     options.add_experimental_option("prefs", prefs)
+    if os.getenv("BTS_HEADLESS", "0").strip().lower() in {"1", "true", "yes"}:
+        options.add_argument("--headless=new")
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--no-sandbox")
+    cache_dir = _Path(os.getenv("BTS_WEBDRIVER_CACHE_DIR", str(BASE_DIR / ".wdm")))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    driver_manager = ChromeDriverManager(
+        cache_manager=DriverCacheManager(root_dir=str(cache_dir))
+    )
     driver = webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()),
+        service=Service(driver_manager.install()),
         options=options
     )
     driver.maximize_window()
@@ -208,17 +231,42 @@ def setup_driver():
 
 # ── DOWNLOAD LOGIC ────────────────────────────────────────────────────────────
 
-def wait_for_download(raw_dir, existing_files, timeout=180):
+def validate_download_file(path, expected_year=None, expected_month=None):
+    """Return True only for a readable ZIP containing a BTS CSV.
+
+    Chrome can create auxiliary files in the download directory, and a
+    partially-written ZIP may briefly exist after the browser renames it. The
+    pipeline must not treat either as a valid monthly source file.
+    """
+    if not os.path.isfile(path) or not path.lower().endswith(".zip"):
+        return False
+    try:
+        with zipfile.ZipFile(path, "r") as archive:
+            if archive.testzip() is not None:
+                return False
+            csv_members = [name for name in archive.namelist() if name.lower().endswith(".csv")]
+            if len(csv_members) != 1:
+                return False
+            if expected_year is not None and expected_month is not None:
+                name = os.path.basename(path)
+                if not _matches_period(name, expected_year, expected_month):
+                    return False
+            return True
+    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        return False
+
+
+def wait_for_download(raw_dir, existing_files, expected_year=None, expected_month=None, timeout=180):
     start = time.time()
     while time.time() - start < timeout:
         current_files = set(os.listdir(raw_dir))
         new_files = current_files - existing_files
-        complete = [f for f in new_files
-                    if not f.endswith('.crdownload') and
-                       not f.endswith('.tmp') and
-                       not f.startswith('.')]
-        if complete:
-            return complete[0]
+        for filename in sorted(new_files):
+            if filename.endswith('.crdownload') or filename.endswith('.tmp') or filename.startswith('.'):
+                continue
+            path = os.path.join(raw_dir, filename)
+            if validate_download_file(path, expected_year=expected_year, expected_month=expected_month):
+                return filename
         time.sleep(2)
     return None
 
@@ -331,11 +379,17 @@ def download_month(driver, wait, year, month):
         pass  # no alert; proceed normally
 
     print(f"    Waiting for download...")
-    filename = wait_for_download(RAW_DIR, existing_files, timeout=DOWNLOAD_WAIT)
+    filename = wait_for_download(
+        RAW_DIR,
+        existing_files,
+        expected_year=year,
+        expected_month=month,
+        timeout=DOWNLOAD_WAIT,
+    )
 
     if filename:
         size_mb = os.path.getsize(os.path.join(RAW_DIR, filename)) / 1024 / 1024
-        print(f"    Done — {filename} ({size_mb:.1f} MB)")
+        print(f"    Done — validated {filename} ({size_mb:.1f} MB)")
         return True
     else:
         print(f"    Timed out — {MONTH_NAMES[month]} {year} may have failed")

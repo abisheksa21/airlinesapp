@@ -14,6 +14,9 @@
 Data/
 Outputs/
 Logs/
+.wdm/
+.pytest-*-temp/
+.pytest-*/
 
 # Python
 __pycache__/

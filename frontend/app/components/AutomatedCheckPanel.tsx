@@ -57,7 +57,11 @@ export default function AutomatedCheckPanel({ initial }: { initial: PipelineChec
     startedAtRef.current = check?.checked_at ?? null;
     try {
       const res = await fetch(`${API_BASE}/api/admin/check-for-updates`, { method: "POST" });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setMessage(typeof data.detail === "string" ? data.detail : `Could not start the check (${res.status}).`);
+        return;
+      }
       if (data.status === "already_running") {
         setMessage("A check is already running \u2014 watching for it to finish.");
         setRunning(true);

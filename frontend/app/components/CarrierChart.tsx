@@ -16,7 +16,6 @@ type Carrier = {
   carrier: string;
   total_flights: number;
   on_time_rate: number;
-  avg_arrival_delay_minutes: number;
   cancellation_rate: number;
 };
 

@@ -3,6 +3,7 @@
 # Unzips each monthly file, cleans data, saves as CSV to Data/Clean/ (keeps all BTS columns)
 
 import os
+import re
 import zipfile
 import pandas as pd
 from pathlib import Path
@@ -41,28 +42,33 @@ def find_zip_files(raw_dir):
 
 def parse_year_month(filename):
     """Extract year and month from BTS filename."""
-    # Pattern: ...2025_1.zip or ...2025_12.zip
+    # Pattern: ...2025_1.zip, ...2025_12.zip, or Chrome's ...2025_1 (1).zip
     name = Path(filename).stem
-    parts = name.split('_')
-    try:
-        year  = int(parts[-2])
-        month = int(parts[-1])
-        return year, month
-    except:
+    match = re.search(r"_(\d{4})_(\d{1,2})(?: \(\d+\))?$", name)
+    if not match:
         return None, None
+    year, month = int(match.group(1)), int(match.group(2))
+    if not 1 <= month <= 12:
+        return None, None
+    return year, month
 
 
 def unzip_file(zip_path, extract_dir):
     """Unzip a BTS file and return path to the CSV inside."""
     os.makedirs(extract_dir, exist_ok=True)
+    extract_root = Path(extract_dir).resolve()
     with zipfile.ZipFile(zip_path, 'r') as z:
-        csv_files = [f for f in z.namelist() if f.endswith('.csv')]
-        if not csv_files:
-            print(f"    No CSV found inside {Path(zip_path).name}")
+        csv_files = [f for f in z.namelist() if f.lower().endswith('.csv')]
+        if len(csv_files) != 1:
+            print(f"    Expected exactly one CSV inside {Path(zip_path).name}; found {len(csv_files)}")
             return None
         csv_name = csv_files[0]
+        extracted_path = (extract_root / csv_name).resolve()
+        if extract_root not in extracted_path.parents:
+            print(f"    Unsafe archive path rejected: {csv_name}")
+            return None
         z.extract(csv_name, extract_dir)
-        return os.path.join(extract_dir, csv_name)
+        return str(extracted_path)
 
 
 def clean_dataframe(df):
@@ -153,7 +159,19 @@ def process_zip(zip_path, clean_dir, temp_dir):
 
     # Save clean file
     os.makedirs(clean_dir, exist_ok=True)
-    df.to_csv(output_path, index=False)
+    # Write to a sibling part-file first so an interrupted write cannot look
+    # like a complete clean month on the next run.
+    temp_output_path = f"{output_path}.part"
+    try:
+        df.to_csv(temp_output_path, index=False)
+        os.replace(temp_output_path, output_path)
+    except Exception:
+        try:
+            if os.path.exists(temp_output_path):
+                os.remove(temp_output_path)
+        except OSError:
+            pass
+        raise
     size_mb = os.path.getsize(output_path) / 1024 / 1024
     print(f"    Saved → {output_name} ({size_mb:.1f} MB)")
 

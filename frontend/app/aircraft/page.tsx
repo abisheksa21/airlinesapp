@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from "react";
 import Link from "next/link";
+import { formatNumber } from "../lib/format";
 import AircraftChart from "../components/AircraftChart";
 import { Health } from "../lib/health";
 import DateRangePreset from "../components/DateRangePreset";
@@ -29,7 +30,7 @@ type AircraftDetail = {
   last_flight: string;
   carrier_count: number;
   on_time_rate: number;
-  avg_arrival_delay_minutes: number;
+  avg_arrival_delay_minutes: number | null;
   cancellation_rate: number;
   health: Health | null;
   carriers: Carrier[];
@@ -319,7 +320,7 @@ export default function AircraftPage() {
               <div className="board board-compact" style={{ marginTop: "1rem" }}>
                 <Tile label="Total flights" value={detail.total_flights.toLocaleString()} />
                 <Tile label="On-time rate" value={`${(detail.on_time_rate * 100).toFixed(1)}%`} />
-                <Tile label="Avg arrival delay" value={`${detail.avg_arrival_delay_minutes.toFixed(1)} min`} tone="rust" />
+                <Tile label="Avg arrival delay" value={`${formatNumber(detail.avg_arrival_delay_minutes)} min`} tone="rust" />
                 <Tile label="Cancellation rate" value={`${(detail.cancellation_rate * 100).toFixed(2)}%`} tone="rust" />
               </div>
 

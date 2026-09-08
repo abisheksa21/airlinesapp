@@ -22,6 +22,8 @@ requirement, not because it's been proven to work.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
+import os
 from typing import Protocol, Union
 
 import numpy as np
@@ -42,10 +44,11 @@ class MilpFormulation:
 @dataclass
 class MilpSolution:
     success: bool
-    status: str  # "optimal" | "infeasible" | "error"
+    status: str  # "optimal" | "infeasible" | "time_limit" | "error"
     x: np.ndarray | None
     objective: float
     solve_seconds: float = 0.0
+    message: str | None = None
 
 
 class OptimizationBackend(Protocol):
@@ -57,6 +60,16 @@ class PublicBackend:
     instance sizes -- this is what a public deployment should use, since it
     needs no license and no external service."""
 
+    def __init__(self, time_limit_seconds: float | None = None):
+        configured = os.getenv("AIRLINE_SOLVER_TIME_LIMIT_SECONDS", "30")
+        try:
+            configured_seconds = float(configured)
+        except ValueError:
+            configured_seconds = 30.0
+        if not math.isfinite(configured_seconds) or configured_seconds <= 0:
+            configured_seconds = 30.0
+        self.time_limit_seconds = time_limit_seconds if time_limit_seconds is not None else configured_seconds
+
     def solve(self, formulation: MilpFormulation) -> MilpSolution:
         import time
         from scipy.optimize import milp, LinearConstraint, Bounds
@@ -65,18 +78,23 @@ class PublicBackend:
         constraints = LinearConstraint(formulation.A, formulation.lb, formulation.ub)
         bounds = Bounds(formulation.var_lb, formulation.var_ub)
         try:
+            options = {}
+            if self.time_limit_seconds > 0:
+                options["time_limit"] = self.time_limit_seconds
             res = milp(
                 c=formulation.c,
                 constraints=constraints,
                 integrality=formulation.integrality,
                 bounds=bounds,
+                options=options,
             )
         except Exception as exc:
-            return MilpSolution(success=False, status="error", x=None, objective=0.0)
+            return MilpSolution(success=False, status="error", x=None, objective=0.0, message=str(exc))
         elapsed = time.monotonic() - start
         if not res.success:
-            return MilpSolution(success=False, status="infeasible", x=None, objective=0.0, solve_seconds=elapsed)
-        return MilpSolution(success=True, status="optimal", x=res.x, objective=float(res.fun), solve_seconds=elapsed)
+            status = "time_limit" if getattr(res, "status", None) == 1 else "infeasible"
+            return MilpSolution(success=False, status=status, x=None, objective=0.0, solve_seconds=elapsed, message=getattr(res, "message", None))
+        return MilpSolution(success=True, status="optimal", x=res.x, objective=float(res.fun), solve_seconds=elapsed, message=getattr(res, "message", None))
 
 
 class GurobiBackend:

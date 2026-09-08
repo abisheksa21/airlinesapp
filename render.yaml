@@ -24,6 +24,10 @@ services:
     # given the warehouse's size -- see DEPLOYMENT.md if you want to compare against Railway instead.
     healthCheckPath: /api/health  # deliberately NOT /api/data-health -- that one queries the full warehouse and measured 5.3s locally; a platform health check needs to be instant, or a slow/constrained instance risks getting marked unhealthy and restarted
     envVars:
+      - key: APP_ENV
+        value: production
+      - key: PIPELINE_ADMIN_TOKEN
+        sync: false  # required for any private pipeline trigger; never commit it
       - key: ANTHROPIC_API_KEY
         sync: false  # set manually in the Render dashboard -- never in this file, never in the repo
       - key: CLAUDE_MODEL_PUBLIC

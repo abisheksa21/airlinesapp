@@ -10,9 +10,9 @@ export default function MethodologyPage() {
     <main className="page">
       <header className="header">
         <p className="eyebrow">DOT On-Time Performance &middot; Methodology</p>
-        <h1 className="title">How the Health Score works</h1>
+        <h1 className="title">How the analysis works</h1>
         <p className="subtitle">
-          The plain-language version, then the full formulas for anyone who wants them.
+          Plain-language explanations first, then the full formulas for the Health Score and Decision Center.
         </p>
       </header>
 

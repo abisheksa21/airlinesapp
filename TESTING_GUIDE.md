@@ -88,8 +88,9 @@ Copy-Item .env.local.example .env.local
 npm install
 ```
 
-`.env.local` already defaults to `http://127.0.0.1:8000`, matching the
-backend from Step 5 -- no edit needed for local testing.
+`.env.local` defaults to `http://127.0.0.1:8002` for this machine because
+port 8000 is already used by another local API service. The supplied
+`start_app.ps1` launcher starts AirlinesApp on that matching port.
 
 ### Step 7: Start the frontend
 
@@ -110,29 +111,44 @@ Part 2 can begin.
 
 **Frontend started cleanly** (Step 7) -- no errors, page loads.
 
-**Real automated build checks** -- these are things I could never actually
-run myself (no network access in my environment):
+**Real automated build checks**:
 ```powershell
 cd frontend
 npm run typecheck
 npm run build
 ```
-Both should complete with no errors. This is the first genuine `tsc` and
-`next build` this code has ever been checked against -- everything I
-verified on my end was bracket-matching, not a real compile.
+`npm run typecheck` has been run successfully during this hardening pass.
+`npm run build` remains a useful follow-up check because it exercises Next's
+production compilation and route generation as well.
 
-**The real pytest suite** -- also something I could never actually run:
+**The real pytest suite**:
 ```powershell
 cd ..
 pytest tests\ -v
 ```
-Expect **29 tests**, all passing. I verified every one of these by running
-the underlying logic directly in my own environment (no `pytest` installed
-there), so this is the first time they'll run through the real `pytest`
-CLI. If anything fails here that I reported as passing, that's a real,
-important discrepancy -- tell me exactly which test and the error.
+Use `pytest --collect-only -q` to see the current count; it is intentionally
+not hard-coded in this guide because the suite grows with each analytical
+feature. The test suite should complete with a clean exit, not merely print
+passing dots.
 
 ### Tier 1 — This sprint's work (newest, least tested, highest priority)
+
+**The compact analytics layer.** If you started with an existing DuckDB copy,
+refresh the derived tables once from the project root:
+```powershell
+python -m pipeline.materialize_analytics
+```
+The command should print row counts for five `analytics_*` tables. It is
+safe to repeat: these are replaceable summaries rebuilt from `flights`.
+The public home, carrier, route, and airport rankings should then load from
+those summaries, while detailed profiles continue to use the raw table where
+their extra dimensions require it.
+
+**The T-100 evidence page.** Switch to Researcher view → T-100. It should show
+the matched carrier/route/month count, average seats filled, average on-time
+rate, a plain-language relationship label, and a passenger-sorted table. The
+page must say “association” rather than “cause”; that distinction is part of
+the result, not a decorative disclaimer.
 
 **The on-time-rate fix (32 sites).** Pick any carrier or airport profile
 page, note the on-time rate shown. This should now correctly exclude
@@ -143,7 +159,7 @@ about whether the on-time number looks like it's excluding cancellations
 (it should be somewhat higher than before this fix, especially for
 carriers/periods with more cancellations).
 
-**The OR features -- no UI yet, so test via Python directly:**
+**The OR features -- test through Decision Center or directly via Python:**
 ```powershell
 python -c "
 from api.optimization.departure_bank import BankFlight, solve_departure_bank

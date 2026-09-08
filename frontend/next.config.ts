@@ -4,6 +4,13 @@ import path from "path";
 const nextConfig: NextConfig = {
   reactStrictMode: true,
   allowedDevOrigins: ["127.0.0.1", "localhost"],
+  // Keep production builds usable on small CI/deployment workers. The
+  // default parallel page workers made this 16-route app peak above the
+  // available memory in constrained environments even after compilation
+  // and type-checking had already succeeded.
+  experimental: {
+    cpus: 1,
+  },
   // Explicitly pins the workspace root to this frontend/ folder. Without
   // this, Next.js guesses based on nearby lockfiles -- a real build log
   // showed it finding a stray root-level package-lock.json (a leftover

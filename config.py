@@ -23,6 +23,12 @@ def _path_from_env(name: str, default: Path) -> Path:
 DATA_DIR = _path_from_env("AIRLINE_DATA_DIR", BASE_DIR / "Data")
 RAW_DIR = DATA_DIR / "Raw"
 CLEAN_DIR = DATA_DIR / "Clean"
+# Additional BTS datasets live in their own namespaces. Keeping them separate
+# from the flight-level On-Time files prevents a monthly aggregate from being
+# accidentally treated as one row per flight.
+BTS_RAW_DIR = RAW_DIR / "bts"
+BTS_CLEAN_DIR = CLEAN_DIR / "bts"
+BTS_MANIFEST_FILE = DATA_DIR / "bts_manifest.json"
 OUTPUT_DIR = _path_from_env("AIRLINE_OUTPUT_DIR", BASE_DIR / "Outputs")
 LOG_DIR = _path_from_env("AIRLINE_LOG_DIR", BASE_DIR / "Logs")
 NOTEBOOK_DIR = BASE_DIR / "Notebooks"
@@ -39,7 +45,17 @@ DUCKDB_FILE = _path_from_env(
 # Preserve the established local workflow while allowing read-only deployments to
 # opt out of directory creation.
 if os.getenv("AIRLINE_CREATE_RUNTIME_DIRS", "1").strip().lower() not in {"0", "false", "no"}:
-    for folder in [DATA_DIR, RAW_DIR, CLEAN_DIR, WAREHOUSE_DIR, OUTPUT_DIR, LOG_DIR, NOTEBOOK_DIR]:
+    for folder in [
+        DATA_DIR,
+        RAW_DIR,
+        CLEAN_DIR,
+        BTS_RAW_DIR,
+        BTS_CLEAN_DIR,
+        WAREHOUSE_DIR,
+        OUTPUT_DIR,
+        LOG_DIR,
+        NOTEBOOK_DIR,
+    ]:
         folder.mkdir(parents=True, exist_ok=True)
 
 
@@ -47,6 +63,14 @@ ON_TIME_THRESHOLD = 15
 TIGHT_TURNAROUND = 25
 TARGET_TURNAROUND = 45
 MAJOR_DELAY = 60
+
+# Operational safeguards. These are deliberately environment-configurable so a
+# small local machine and a larger deployment can use different limits without
+# changing the analytical formulas.
+DEFAULT_HEAVY_LOOKBACK_DAYS = int(os.getenv("AIRLINE_DEFAULT_HEAVY_LOOKBACK_DAYS", "365"))
+DEFAULT_MODEL_LOOKBACK_DAYS = int(os.getenv("AIRLINE_DEFAULT_MODEL_LOOKBACK_DAYS", "1825"))
+PIPELINE_ADMIN_TOKEN = os.getenv("PIPELINE_ADMIN_TOKEN", "").strip()
+APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
 
 BG_COLOR = "#0f1117"
 GRID_COLOR = "#222233"

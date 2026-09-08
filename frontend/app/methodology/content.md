@@ -22,7 +22,7 @@ The simplest approach would be to just average all five equally, or pick weights
 
 Instead, we asked a real question: **if we only knew how a route performed in the past, which of these five things actually tells us something useful about how it'll perform in the future?**
 
-Here's how we tested that. We took thousands of real routes and split each one's history in half — an earlier chunk and a later chunk. We calculated all five scores using *only* the earlier chunk. Then we checked: for each of the five, how well did it predict that same route's *actual* on-time performance in the later chunk — performance we hadn't shown it yet?
+Here's how we tested that. We took thousands of real routes and split each one's history chronologically into an earlier 70% chunk and a later 30% chunk. We calculated all five scores using *only* the earlier chunk. Then we checked: for each of the five, how well did it predict that same route's *actual* on-time performance in the later chunk — performance we hadn't shown it yet?
 
 Some of the five turned out to be much better predictors than others. So instead of guessing, we let the past-vs-future test decide how much each one should count.
 
@@ -218,3 +218,311 @@ A score of 78.9 falls in the **Watch** band (70–79) — decent overall, on-tim
 - This is a **linear, transparent v2 formula**, not a machine-learning model. It doesn't account for interactions between factors (e.g., a route that's bad on both delay *and* cancellations isn't penalized any more than the simple sum would suggest).
 - The calibration was done once, on the data available at the time. If BTS data patterns shift meaningfully over time, these weights could eventually warrant re-testing.
 - A small-sample warning appears on the score itself when there isn't much data behind it, since percentages computed from a handful of flights are noisy.
+
+---
+
+# Decision Center methodology
+
+The Decision Center is a collection of small, explainable tools. They answer
+different questions, so they intentionally do not collapse everything into one
+opaque “airline intelligence” score.
+
+## How to read the tools
+
+- **Descriptive tools** summarize what happened in the historical data.
+- **Predictive tools** estimate what may happen next and must be checked against
+  their test metrics.
+- **Optimization tools** choose an action under explicit limits. They do not
+  prove that the recommended action will cause a particular improvement.
+
+Every result should be read with its data grain, sample size, and limitations.
+The application uses real BTS records and transparent derived measures. A
+historical proxy is labeled as a proxy; it is never presented as certified
+airport capacity or as a causal intervention effect.
+
+## Health Score Levers
+
+This view uses the Health Score formula above. For one selected carrier, each
+component is changed one at a time to the current network median:
+
+```text
+hypothetical score = current score
+  - (current component × component weight)
+  + (network median × component weight)
+```
+
+The difference is the **point gain**. This is a sensitivity calculation: it
+answers “where is the arithmetic gap?” It does not answer “which fix is easiest?”
+and it does not claim that a carrier can actually move a component to the
+median.
+
+The Network Opportunity Ranking repeats the same calculation for every carrier.
+Point gain and flight volume remain separate because multiplying them would
+create a priority number with no validated meaning.
+
+## Turnaround Scenarios
+
+This view is a 3 × 3 historical table. Flights are paired only when they use
+the same aircraft tail on the same calendar day. Flights are ordered by their
+scheduled departure time. The table groups the scheduled turnaround between
+the two flights as:
+
+- **Tight:** 25 minutes or less
+- **Normal:** 26–45 minutes
+- **Loose:** more than 45 minutes
+
+The previous flight’s arrival delay is grouped as on time, 1–60 minutes late,
+or more than 60 minutes late. Each cell reports the average departure delay of
+the next flight and the number of observed pairs.
+
+This is an association in observed operations, not a controlled experiment. A
+carrier may assign short turnarounds to different kinds of flights than long
+turnarounds, so the table should not be read as “changing the turnaround will
+produce exactly this delay.”
+
+## Network Opportunity Ranking
+
+This is a network-wide sensitivity ranking, not a new model. For each carrier,
+the largest positive one-component Health Score gap is retained. The display
+also reports the carrier’s flight volume so the reader can compare:
+
+```text
+arithmetic opportunity  versus  operational reach
+```
+
+The application does not decide which side matters more. That decision belongs
+to the analyst and depends on whether the goal is the cleanest measurable gap
+or the broadest exposure.
+
+## Predictive Risk Screen
+
+The risk screen predicts whether the following month’s severe-delay rate will
+be in the network’s worst quartile. It uses a regularized logistic model:
+
+```text
+p = 1 / (1 + exp(-(β₀ + β₁x₁ + ... + β₈x₈)))
+```
+
+The eight current-month features are severe-delay rate, cancellation rate,
+average departure delay, late-aircraft delay share, ground-time share, logged
+flight volume, recent severe-delay trend, and seasonal index.
+
+The recent trend compares the current month with the entity’s prior three
+calendar months. The seasonal index compares the same calendar month in prior
+history with the entity’s own overall historical level. Both use only history
+available before the feature month.
+
+The panel is split chronologically into training, validation, and test data.
+Features are standardized using the training set. A Platt calibrator is fit on
+validation predictions so a displayed probability is more than a ranking. The
+test set is kept separate and reports PR-AUC, Brier score, log loss, and
+predicted-versus-observed calibration bins.
+
+If PR-AUC is close to the test-set positive rate, the model found little useful
+signal. A high or low label is therefore a screening signal, not a certainty.
+
+## Departure Bank Smoothing
+
+This is the most detailed optimizer in the Decision Center. A departure bank
+is divided into 15-minute buckets. For every flight `i` and feasible bucket
+`t`, the binary variable `x(i,t)` is 1 when that flight is assigned there.
+
+The core rule is:
+
+```text
+sum over feasible t of x(i,t) = 1       for every flight i
+```
+
+Feasible buckets are limited by the selected ±15, ±30, or ±45 minute movement
+window. An optional moved-flight cap limits disruption.
+
+The optimizer minimizes three visible ideas:
+
+```text
+congestion exposure
++ historical delay proxy
++ schedule-shift penalty
+```
+
+Overload above the preferred bank limit uses three increasing cost tiers. This
+means placing the same excess into one new peak is more expensive than spreading
+it across several nearby buckets.
+
+The expected mode uses the historical average delay of each bucket. The
+risk-averse mode uses a standard CVaR construction to give extra weight to bad
+historical scenarios. CVaR is useful when avoiding tail risk matters more than
+the average, but it is not required for the basic interpretation.
+
+The public application uses the open-source HiGHS solver through
+`scipy.optimize.milp`. The optional Gurobi backend is an explicit research
+adapter and is not silently selected or treated as validated.
+
+The “capacity” limit is an empirical throughput proxy derived from the project’s
+queue-pressure analysis and, by default, a seasonal historical baseline. BTS
+does not provide certified gate, runway, or slot capacity in this dataset. The
+optimizer also lacks crew legality, aircraft rotation, connection, curfew, and
+gate constraints. Its result means “this historical bank can be mathematically
+spread under these stated assumptions,” not “this is an executable airline
+schedule.”
+
+## Network Protection Portfolio
+
+This is a small resource-allocation optimizer. Each candidate carrier or
+airport has a binary selection variable `x(j)`:
+
+```text
+maximize  sum(metric(j) × x(j))
+subject to sum(cost(j) × x(j)) <= budget
+           x(j) is either 0 or 1
+```
+
+The user chooses exactly one primary metric, such as severe-delay exposure,
+reliability, cancellation exposure, or flight volume. The optimizer does not
+silently blend all metrics. It reports the other metrics afterward so the
+trade-offs stay visible.
+
+The available costs are resource proxies: equal attention, flight-volume
+exposure, or square-root flight-volume exposure. They are not dollars unless
+real intervention-cost data is supplied.
+
+For selected candidates, marginal gain is calculated by removing one candidate
+and solving again. This shows how much the optimized coverage would fall if
+that candidate were unavailable. It is a sensitivity result, not an estimate
+of the operational benefit of an intervention.
+
+## Network Resilience Ranking
+
+The network is represented as a directed graph:
+
+- Airport = node
+- Origin → destination route = edge
+- Route volume = edge reference weight
+
+Routes below the selected minimum-flight floor are excluded so one-off service
+does not dominate the graph.
+
+Two measures are kept separate:
+
+1. **Degree / volume:** how many routes touch an airport and how many flights
+   pass through it.
+2. **Betweenness centrality:** the share of shortest paths between other
+   airports that pass through the airport. Shortest path means fewest hops in
+   the current unweighted directed graph.
+
+Betweenness is a structural bridge proxy. It is not a simulation of closing an
+airport, rerouting passengers, or calculating the resulting delay impact. The
+current graph is also static over the full available history rather than a
+month-by-month network evolution model.
+
+## T-100 and On-time correlation
+
+The T-100 enrichment is loaded separately from the flight-level OTP table. The
+current warehouse contains:
+
+| Dataset | Warehouse object | Grain | Current loaded history |
+|---|---|---|---|
+| T-100 Domestic Segment | `bts_t100_segment` and `bts_t100_segment_route_month` | carrier + route + month, with aircraft/service-class rows aggregated | January 2018–May 2026 |
+| T-100 Domestic Market | `bts_t100_market` and `bts_t100_market_route_month` | carrier + market + month | January 2018–May 2026 |
+| Carrier Decode | `bts_carrier_decode` | carrier code + effective dates | reference table |
+| Master Coordinate | `bts_master_coordinate` | airport version + effective dates | reference table |
+| Aircraft Types | `bts_aircraft_types` | aircraft type | reference table |
+
+There are 101 raw and cleaned monthly files for each T-100 Segment and Market
+dataset. The Segment route-month view calculates:
+
+```text
+load factor       = passengers / seats available
+completion rate   = departures performed / departures scheduled
+```
+
+The **T-100 & On-time** Decision Center view uses a safe grain-matched process:
+
+1. Aggregate the OTP flight table to carrier + origin + destination + month.
+2. Calculate OTP flights, completed flights, on-time rate, and average arrival
+   delay at that same grain.
+3. Join that result to the T-100 Segment route-month view on carrier, route,
+   year, and month.
+4. Display the matched observations and Pearson correlations.
+
+The correlation is calculated as:
+
+```text
+r = covariance(T-100 measure, on-time rate)
+    / (standard deviation of T-100 measure × standard deviation of on-time rate)
+```
+
+The displayed measures include load factor, passengers, and seats. The value is
+between −1 and +1: positive values move together, negative values move in
+opposite directions, and values near zero show weak linear association.
+
+This is exploratory evidence, not causation. Season, route mix, weather,
+airport congestion, schedule design, and carrier decisions can affect both
+traffic measures and OTP. The view requires a minimum OTP flight count so tiny
+route-month samples do not look more precise than they are.
+
+Most importantly, a monthly T-100 passenger or seat total is never copied onto
+every flight row. That would multiply the aggregate and create false exposure.
+The source and availability status remain available through
+`/api/data-sources`; the matched comparison is served by
+`/api/capacity/correlation`.
+
+## Supporting queue-pressure model
+
+Queue pressure is currently an API capability and supporting input to the
+departure-bank optimizer. It groups departures into hourly banks and estimates
+historical effective capacity as the 90th percentile of completed departures
+for that airport and hour.
+
+The visible pressure score combines four normalized signals:
+
+```text
+45% utilization + 25% delay accumulation
++ 20% departure delay + 10% taxi-out time
+```
+
+The additional M/G/c estimate uses taxi-out as the service-time proxy:
+
+```text
+utilization ρ = arrival rate λ / (servers c × service rate μ)
+```
+
+Erlang-C estimates the chance of waiting, and the Allen–Cunneen adjustment
+accounts for variation in taxi-out times. The number of parallel “servers” is
+inferred from historical throughput, not claimed to be the number of runways
+or gates. If utilization is at least 1, the model reports an unstable queue
+instead of inventing a finite steady-state wait.
+
+## Supporting Markov delay propagation
+
+The Markov endpoint models four arrival-delay states: on time, minor,
+moderate, and severe. For each turnaround bucket, it estimates:
+
+```text
+P(from state → next state)
+```
+
+from consecutive same-tail, same-day flights. A multi-leg forecast uses matrix
+powers:
+
+```text
+future state distribution = current distribution × P^k
+```
+
+This is an empirical propagation pattern, not proof that one delay caused the
+next. The convenience forecast assumes the same turnaround bucket on every
+leg; real rotations can mix buckets. The endpoint is available in the backend
+but is intentionally kept out of the main Decision Center until it has a
+simple visual explanation.
+
+## What is deliberately not modeled
+
+The current Decision Center does not claim to solve the full airline planning
+problem. It does not have certified airport capacity, gate assignments, crew
+rules, aircraft rotations, passenger itineraries, ticket revenue, or airline
+intervention costs. Those would be required before building a full scheduling,
+fleet, crew, or revenue optimizer.
+
+The current design is intentionally a small stack of transparent arithmetic,
+descriptive statistics, one interpretable predictive model, graph measures, and
+bounded optimizers. That gives useful data intelligence without hiding the
+assumptions inside unnecessary mathematical complexity.

@@ -5,6 +5,7 @@ import { useSearchParams } from "next/navigation";
 import { CARRIER_NAMES, carrierColor, carrierName } from "../lib/carriers";
 import ComparisonChart, { ScenarioTrend } from "../components/ComparisonChart";
 import EntityCompare from "../components/EntityCompare";
+import { formatNumber } from "../lib/format";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 
@@ -30,7 +31,7 @@ type Run = {
 type Summary = {
   total_flights: number;
   on_time_rate: number;
-  avg_arrival_delay_minutes: number;
+  avg_arrival_delay_minutes: number | null;
   cancellation_rate: number;
 };
 
@@ -419,7 +420,9 @@ function ComparePageInner() {
                   {(() => {
                     const otr = bestWorstIndices(results, (r) => r.summary?.on_time_rate ?? null);
                     const delay = bestWorstIndices(results, (r) =>
-                      r.summary ? -r.summary.avg_arrival_delay_minutes : null
+                      r.summary?.avg_arrival_delay_minutes == null
+                        ? null
+                        : -r.summary.avg_arrival_delay_minutes
                     );
                     const cancel = bestWorstIndices(results, (r) =>
                       r.summary ? -r.summary.cancellation_rate : null
@@ -438,7 +441,7 @@ function ComparePageInner() {
                           <td>Avg arrival delay</td>
                           {results.map((r, i) => (
                             <td key={r.run.key} className={cellClass(i, delay.best, delay.worst)}>
-                              {r.error ? "\u2014" : `${r.summary!.avg_arrival_delay_minutes.toFixed(1)} min`}
+                              {r.error ? "\u2014" : `${formatNumber(r.summary!.avg_arrival_delay_minutes)} min`}
                             </td>
                           ))}
                         </tr>

@@ -11,7 +11,9 @@ import RouteChart from "../../components/RouteChart";
 import AirportChart from "../../components/AirportChart";
 import SchedulePaddingChart from "../../components/SchedulePaddingChart";
 import CodeshareChart from "../../components/CodeshareChart";
+import ReferencePanel from "../../components/ReferencePanel";
 import { carrierName, CARRIER_PROFILES } from "../../lib/carriers";
+import { getCarrierReference } from "../../lib/reference-profiles";
 import { useMode } from "../../lib/mode";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
@@ -44,6 +46,8 @@ function scoreColor(score: number): string {
 
 const RESEARCHER_TABS = ["Health Score", "Trend", "Delays & Routes", "Schedule & Codeshare"] as const;
 type ResearcherTab = (typeof RESEARCHER_TABS)[number];
+const PUBLIC_TABS = ["Overview", "About", "Performance"] as const;
+type PublicTab = (typeof PUBLIC_TABS)[number];
 
 export default function CarrierProfilePage() {
   return (
@@ -58,6 +62,7 @@ function CarrierProfilePageInner() {
   const searchParams = useSearchParams();
   const code = String(params.code ?? "").toUpperCase();
   const profile = CARRIER_PROFILES[code];
+  const reference = getCarrierReference(code);
   const { mode, setMode } = useMode();
 
   // Carried over from a Quick Lookup elsewhere on the site (?start=...&end=...)
@@ -72,6 +77,7 @@ function CarrierProfilePageInner() {
   const [paddingGranularity, setPaddingGranularity] = useState<"day" | "week" | "month" | "year">("month");
   const [codeshare, setCodeshare] = useState<any>(null);
   const [tab, setTab] = useState<ResearcherTab>("Health Score");
+  const [publicTab, setPublicTab] = useState<PublicTab>("Overview");
 
   // No protection against out-of-order responses existed here before --
   // confirmed via code review after a real bug report. Rapid filter
@@ -169,7 +175,7 @@ function CarrierProfilePageInner() {
   }, []);
 
   return (
-    <main className="page">
+    <main className={`page entity-profile-page ${mode === "researcher" ? "entity-profile-researcher" : "entity-profile-public"}`}>
       <header className="header">
         <p className="eyebrow">DOT On-Time Performance &middot; Carrier Profile</p>
         <h1 className="title">{carrierName(code)} ({code})</h1>
@@ -183,18 +189,25 @@ function CarrierProfilePageInner() {
       {error && <p className="error-text">Could not load this profile &mdash; check the API is running.</p>}
       {!detail && !notFound && !error && <p className="error-text">Loading...</p>}
 
-      {detail && mode === "public" && (
+      {mode === "public" && (
         <section className="section">
-          <div className="screen">
-            {profile && (
-              <p className="page-note" style={{ marginBottom: "1rem" }}>
-                Founded {profile.founded} &middot; Headquarters {profile.headquarters}
-                <br />
-                {profile.overview}
-              </p>
-            )}
+          <div className="public-profile-shell">
+            <div className="public-profile-tabs" role="tablist" aria-label="Public profile sections">
+              {PUBLIC_TABS.map((item) => <button key={item} type="button" role="tab" aria-selected={publicTab === item} className={publicTab === item ? "active" : ""} onClick={() => setPublicTab(item)}>{item}</button>)}
+            </div>
 
-            <div className="board">
+            {publicTab === "About" && <ReferencePanel profile={reference} />}
+
+            {publicTab !== "About" && !detail && <div className="profile-data-loading"><span className="loading-pulse" /> Loading measured performance for {code}…<small>The reference profile is already available in the About tab.</small></div>}
+
+            {publicTab !== "About" && detail && <>
+              <div className="public-profile-lede">
+                <p className="eyebrow">{publicTab === "Overview" ? "Plain-language read" : "Performance read"}</p>
+                <h2>{publicTab === "Overview" ? `${carrierName(code)} in one minute` : `How ${carrierName(code)} is performing`}</h2>
+                <p>{publicTab === "Overview" ? (profile?.overview ?? reference.strapline) : "These numbers are calculated from the BTS warehouse for the selected carrier and full available history."}</p>
+              </div>
+
+              <div className="board">
               <div className="tile">
                 <span className="tile-label">Total flights</span>
                 <span className="tile-value">{detail.total_flights.toLocaleString()}</span>
@@ -215,7 +228,7 @@ function CarrierProfilePageInner() {
               </div>
             </div>
 
-            {detail.health && (
+              {detail.health && (
               <div style={{ display: "flex", alignItems: "center", gap: "1.5rem", marginTop: "1.5rem" }}>
                 <span style={{ fontFamily: "var(--font-mono), monospace", fontSize: "2.4rem", fontWeight: 700, color: scoreColor(detail.health.score) }}>
                   {Math.round(detail.health.score)}
@@ -228,18 +241,12 @@ function CarrierProfilePageInner() {
               </div>
             )}
 
-            <p className="page-note" style={{ marginTop: "1.5rem" }}>
-              Want the full breakdown &mdash; trend over time, delay causes, top routes, schedule
-              padding?
-            </p>
-            <button
-              type="button"
-              className="profile-action-button"
-              style={{ marginTop: "0.6rem" }}
-              onClick={() => setMode("researcher")}
-            >
-              Switch to Researcher mode
-            </button>
+              {publicTab === "Performance" && detail.months?.length > 0 && <div className="public-profile-chart"><TrendChart data={detail.months} /></div>}
+              <div className="public-profile-action-row">
+                <button type="button" className="profile-action-button" onClick={() => setMode("researcher")}>Open researcher workspace →</button>
+                <span className="page-note">Trend, causes, top routes, and schedule analysis live there.</span>
+              </div>
+            </>}
           </div>
         </section>
       )}

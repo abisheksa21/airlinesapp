@@ -506,19 +506,25 @@ def get_summary(carrier: str | None = None, start_date: str | None = None, end_d
             return {"error": "No flights matched that filter."}
 
         # Unique airports touched, counting an airport once whether it shows
-        # up as an origin, a destination, or both -- COUNT(DISTINCT Origin)
-        # alone would undercount any airport that (in this filtered scope)
-        # only ever appears as a destination, or vice versa.
-        unique_airports = connection.execute(
-            f"""
-            SELECT COUNT(*) FROM (
-                SELECT Origin AS airport FROM flights WHERE {where} AND Origin IS NOT NULL
-                UNION
-                SELECT Dest AS airport FROM flights WHERE {where} AND Dest IS NOT NULL
-            )
-            """,
-            params + params,
-        ).fetchone()[0]
+        # up as an origin, a destination, or both. Do the two DISTINCT
+        # reductions separately: a UNION over both full table projections
+        # can materialize a very large intermediate relation on the complete
+        # warehouse before reducing it to the few hundred airport codes.
+        origin_airports = {
+            r[0]
+            for r in connection.execute(
+                f"SELECT DISTINCT Origin FROM flights WHERE {where} AND Origin IS NOT NULL",
+                params,
+            ).fetchall()
+        }
+        destination_airports = {
+            r[0]
+            for r in connection.execute(
+                f"SELECT DISTINCT Dest FROM flights WHERE {where} AND Dest IS NOT NULL",
+                params,
+            ).fetchall()
+        }
+        unique_airports = len(origin_airports | destination_airports)
 
     return {
         "total_flights": row[0],
@@ -1801,6 +1807,22 @@ def _claude_stream_request(messages: list[dict], model: str, *, force_final: boo
         raise CopilotError(f"Claude streaming request failed{detail}") from exc
 
 
+def _sanitize_history(history: list[dict] | None) -> list[dict]:
+    """Keep only a bounded amount of plain user/assistant text."""
+    sanitized: list[dict] = []
+    for turn in (history or [])[-12:]:
+        if not isinstance(turn, dict):
+            continue
+        role = turn.get("role")
+        content = turn.get("content")
+        if role not in {"user", "assistant"} or not isinstance(content, str):
+            continue
+        text = content.strip()
+        if text:
+            sanitized.append({"role": role, "content": text[:4000]})
+    return sanitized
+
+
 def stream_copilot(user_message: str, history: list[dict] | None = None, max_hops: int = 4, tier: str | None = None):
     """Generator yielding SSE-ready event dicts as the pipeline progresses:
     tool_start / tool_complete for each tool call, answer_start once the
@@ -1833,7 +1855,7 @@ def stream_copilot(user_message: str, history: list[dict] | None = None, max_hop
     every tool_use block to get a matching tool_result before the next
     call, which this handles by batching them into one follow-up message."""
     model = _model_for_tier(tier)
-    messages = list(history or [])
+    messages = _sanitize_history(history)
     messages.append({"role": "user", "content": user_message})
     tools_used: list[dict] = []
 
@@ -1984,14 +2006,20 @@ def stream_copilot(user_message: str, history: list[dict] | None = None, max_hop
     }
 
 
-def ask_copilot(user_message: str, max_hops: int = 4, tier: str | None = None) -> dict:
+def ask_copilot(
+    user_message: str,
+    max_hops: int = 4,
+    tier: str | None = None,
+    history: list[dict] | None = None,
+) -> dict:
     """Blocking version of stream_copilot -- run the tool-calling loop until
     Claude stops requesting tools or we hit max_hops. Claude may legitimately
     want multiple tool calls (sequentially across hops, or several in one
     hop via parallel tool use) before answering, so a single fixed
     round-trip isn't enough."""
     model = _model_for_tier(tier)
-    messages = [{"role": "user", "content": user_message}]
+    messages = _sanitize_history(history)
+    messages.append({"role": "user", "content": user_message})
     tools_used: list[dict] = []
 
     for _ in range(max_hops):

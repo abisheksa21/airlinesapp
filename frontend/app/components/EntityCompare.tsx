@@ -4,6 +4,7 @@ import { useState, useEffect } from "react";
 import ComparisonChart, { ScenarioTrend } from "./ComparisonChart";
 import TailSearchInput from "./TailSearchInput";
 import { HealthSummary } from "../lib/health";
+import { formatNumber } from "../lib/format";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const PALETTE = ["#e8a33d", "#4f9d8f", "#c9563a", "#5b7fa6", "#8a6642", "#EC008C", "#F9B612", "#00A9E0"];
@@ -27,7 +28,7 @@ type NormalizedResult = {
   label: string;
   total_flights: number;
   on_time_rate: number;
-  avg_arrival_delay_minutes: number;
+  avg_arrival_delay_minutes: number | null;
   cancellation_rate: number;
   health: Health | null;
   months: MonthPoint[];
@@ -271,7 +272,7 @@ export default function EntityCompare({
                 </tr>
                 <tr>
                   <td>Avg arrival delay</td>
-                  {results.map((r) => <td key={r.id}>{r.error ? "\u2014" : `${r.avg_arrival_delay_minutes.toFixed(1)} min`}</td>)}
+                  {results.map((r) => <td key={r.id}>{r.error ? "\u2014" : `${formatNumber(r.avg_arrival_delay_minutes)} min`}</td>)}
                 </tr>
                 <tr>
                   <td>Cancellation rate</td>

@@ -2,9 +2,11 @@
 
 import { useState, useEffect } from "react";
 import Link from "next/link";
+import { formatNumber } from "../lib/format";
 import CarrierChart from "../components/CarrierChart";
 import DateRangePreset from "../components/DateRangePreset";
 import { CARRIER_NAMES, carrierName } from "../lib/carriers";
+import { useMode } from "../lib/mode";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 
@@ -12,14 +14,14 @@ type Carrier = {
   carrier: string;
   total_flights: number;
   on_time_rate: number;
-  avg_arrival_delay_minutes: number;
+  avg_arrival_delay_minutes: number | null;
   cancellation_rate: number;
 };
 
 type Summary = {
   total_flights: number;
   on_time_rate: number;
-  avg_arrival_delay_minutes: number;
+  avg_arrival_delay_minutes: number | null;
   cancellation_rate: number;
 };
 
@@ -35,6 +37,7 @@ function buildQuery(params: Record<string, string>): string {
 }
 
 export default function CarriersPage() {
+  const { mode } = useMode();
   const [ranking, setRanking] = useState<{ carriers: Carrier[] } | null>(null);
 
   const [carrierInput, setCarrierInput] = useState("");
@@ -73,11 +76,13 @@ export default function CarriersPage() {
   }
 
   return (
-    <main className="page">
+    <main className={`page surface-page ${mode === "researcher" ? "surface-researcher" : ""}`}>
       <header className="header">
-        <p className="eyebrow">DOT On-Time Performance &middot; Carriers</p>
+        <p className="eyebrow">DOT On-Time Performance &middot; {mode === "researcher" ? "Research workspace / carriers" : "Carriers"}</p>
         <h1 className="title">Carriers</h1>
-        <p className="subtitle">Overall ranking, or a quick stats check before visiting a full profile.</p>
+        <p className="subtitle">{mode === "researcher"
+          ? "Start with the network ranking, then use the evidence table to choose a carrier profile or a question for the Decision Center."
+          : "A simple comparison of airline reliability, with a quick path into each carrier profile."}</p>
       </header>
 
       <section className="section">
@@ -89,6 +94,39 @@ export default function CarriersPage() {
           {ranking ? <CarrierChart data={ranking.carriers} /> : <p className="error-text">Loading...</p>}
         </div>
       </section>
+
+      {mode === "researcher" && ranking && (
+        <section className="section research-evidence-section">
+          <div className="section-head">
+            <h2 className="section-title">Carrier evidence table</h2>
+            <span className="section-note">The values behind the ranking</span>
+          </div>
+          <div className="screen">
+            <p className="page-note research-reading-note">
+              Read this as a starting map: volume tells you how much of the network is represented, while the rates and delay values describe the historical operating pattern. Select a carrier to open its full profile.
+            </p>
+            <div className="rotation-table-wrap">
+              <table className="compare-table research-data-table">
+                <thead>
+                  <tr><th>Carrier</th><th>Flights</th><th>On-time</th><th>Avg arrival delay</th><th>Cancelled</th><th>Profile</th></tr>
+                </thead>
+                <tbody>
+                  {ranking.carriers.map((carrier) => (
+                    <tr key={carrier.carrier}>
+                      <td><strong>{carrier.carrier}</strong><span className="table-secondary">{carrierName(carrier.carrier)}</span></td>
+                      <td>{carrier.total_flights.toLocaleString()}</td>
+                      <td>{(carrier.on_time_rate * 100).toFixed(1)}%</td>
+                      <td>{formatNumber(carrier.avg_arrival_delay_minutes)} min</td>
+                      <td>{(carrier.cancellation_rate * 100).toFixed(2)}%</td>
+                      <td><Link href={`/carriers/${carrier.carrier}`} className="table-link">Open →</Link></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+      )}
 
       <section className="section">
         <div className="section-head">
@@ -132,7 +170,7 @@ export default function CarriersPage() {
               <div className="board board-compact">
                 <Tile label="Total flights" value={summary.total_flights.toLocaleString()} />
                 <Tile label="On-time rate" value={`${(summary.on_time_rate * 100).toFixed(1)}%`} />
-                <Tile label="Avg arrival delay" value={`${summary.avg_arrival_delay_minutes.toFixed(1)} min`} tone="rust" />
+                <Tile label="Avg arrival delay" value={`${formatNumber(summary.avg_arrival_delay_minutes)} min`} tone="rust" />
                 <Tile label="Cancellation rate" value={`${(summary.cancellation_rate * 100).toFixed(2)}%`} tone="rust" />
               </div>
 

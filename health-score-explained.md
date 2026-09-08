@@ -22,7 +22,7 @@ The simplest approach would be to just average all five equally, or pick weights
 
 Instead, we asked a real question: **if we only knew how a route performed in the past, which of these five things actually tells us something useful about how it'll perform in the future?**
 
-Here's how we tested that. We took thousands of real routes and split each one's history in half — an earlier chunk and a later chunk. We calculated all five scores using *only* the earlier chunk. Then we checked: for each of the five, how well did it predict that same route's *actual* on-time performance in the later chunk — performance we hadn't shown it yet?
+Here's how we tested that. We took thousands of real routes and split each one's history chronologically into an earlier 70% chunk and a later 30% chunk. We calculated all five scores using *only* the earlier chunk. Then we checked: for each of the five, how well did it predict that same route's *actual* on-time performance in the later chunk — performance we hadn't shown it yet?
 
 Some of the five turned out to be much better predictors than others. So instead of guessing, we let the past-vs-future test decide how much each one should count.
 

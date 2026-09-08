@@ -34,6 +34,7 @@ never multiplied into a fake priority score).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 
 import numpy as np
 
@@ -66,8 +67,8 @@ def _solve_selection(
     budget: float,
     primary_metric: str,
     backend: OptimizationBackend,
-) -> tuple[bool, list[int], list[int]]:
-    """Just the knapsack MILP solve -- returns (success, selected_idx,
+) -> tuple[str, list[int], list[int]]:
+    """Just the knapsack MILP solve -- returns (status, selected_idx,
     rejected_idx), no marginal-gain computation. This is the piece
     _compute_marginal_gains must call recursively, NOT solve_portfolio:
     solve_portfolio always computes marginal gains for its own selection,
@@ -89,12 +90,12 @@ def _solve_selection(
     formulation = MilpFormulation(c=c, A=A, lb=lb, ub=ub, integrality=integrality, var_lb=var_lb, var_ub=var_ub)
     solution = backend.solve(formulation)
     if not solution.success:
-        return False, [], []
+        return solution.status, [], []
 
     x = solution.x
     selected_idx = [i for i in range(n) if x[i] > 0.5]
     rejected_idx = [i for i in range(n) if x[i] <= 0.5]
-    return True, selected_idx, rejected_idx
+    return solution.status, selected_idx, rejected_idx
 
 
 def solve_portfolio(
@@ -105,6 +106,14 @@ def solve_portfolio(
 ) -> PortfolioResult:
     backend = backend or PublicBackend()
 
+    if not math.isfinite(budget) or budget < 0:
+        raise ValueError("budget must be a finite non-negative number")
+    for candidate in candidates:
+        if not math.isfinite(candidate.cost) or candidate.cost <= 0:
+            raise ValueError(f"candidate {candidate.candidate_id} must have a finite positive cost")
+    if candidates and any(primary_metric not in candidate.components for candidate in candidates):
+        raise ValueError(f"primary_metric '{primary_metric}' is missing from one or more candidates")
+
     if not candidates:
         return PortfolioResult(
             status="no_candidates", primary_metric=primary_metric, budget=budget,
@@ -112,11 +121,12 @@ def solve_portfolio(
             methodology=_methodology(primary_metric),
         )
 
-    success, selected_idx, rejected_idx = _solve_selection(candidates, budget, primary_metric, backend)
+    solve_status, selected_idx, rejected_idx = _solve_selection(candidates, budget, primary_metric, backend)
 
-    if not success:
+    if solve_status != "optimal":
+        result_status = solve_status if solve_status in {"time_limit", "error"} else "infeasible"
         return PortfolioResult(
-            status="infeasible", primary_metric=primary_metric, budget=budget,
+            status=result_status, primary_metric=primary_metric, budget=budget,
             selected=[], rejected=[{"candidate_id": c.candidate_id, "reason": "solve failed"} for c in candidates],
             resource_consumed=0.0, total_coverage={}, residual_exposure={}, methodology=_methodology(primary_metric),
         )
@@ -175,10 +185,10 @@ def _compute_marginal_gains(candidates, budget, primary_metric, selected_idx, ba
         if not remaining:
             gains[candidates[i].candidate_id] = base_total
             continue
-        sub_success, sub_selected_idx, _ = _solve_selection(remaining, budget, primary_metric, backend)
+        sub_status, sub_selected_idx, _ = _solve_selection(remaining, budget, primary_metric, backend)
         sub_total = (
             sum(remaining[j].components.get(primary_metric, 0.0) for j in sub_selected_idx)
-            if sub_success else 0.0
+            if sub_status == "optimal" else 0.0
         )
         gains[candidates[i].candidate_id] = round(base_total - sub_total, 4)
     return gains
@@ -205,6 +215,11 @@ def _methodology(primary_metric: str) -> dict:
     return {
         "framework": "0/1 knapsack MILP, solved via an open-source HiGHS backend for public/bounded instances.",
         "primary_metric": primary_metric,
+        "cost_policy": (
+            "Costs are explicit candidate inputs. The API can use equal-unit cost, "
+            "flight-volume exposure, or a square-root volume proxy; none should be "
+            "read as dollars until airline-specific intervention-cost data is supplied."
+        ),
         "combination_policy": (
             "The optimizer maximizes ONLY the chosen primary_metric -- volume, severe-delay rate, "
             "propagation, cancellation exposure, and congestion pressure are never combined into an "

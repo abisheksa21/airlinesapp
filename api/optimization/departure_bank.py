@@ -149,6 +149,7 @@ def build_formulation(
     scenario_probs: list[float] | None = None,
     risk_alpha: float = 0.2,
     default_delay_proxy: float = 10.0,
+    max_moved_flights: int | None = None,
 ) -> tuple[MilpFormulation, dict]:
     """Builds the solver-agnostic MILP arrays. Returns (formulation, index_map)
     where index_map explains what each variable column means -- needed to
@@ -192,6 +193,10 @@ def build_formulation(
     pos = {key: i for i, key in enumerate(var_index)}
 
     n_constraints = len(flights) + n_buckets + (len(flights) * n_scenarios if is_risk_averse else 0)
+    if max_moved_flights is not None:
+        if max_moved_flights < 0 or max_moved_flights > len(flights):
+            raise ValueError("max_moved_flights must be between 0 and the number of flights")
+        n_constraints += 1
 
     c = np.zeros(n_vars)
     # Sparse, not dense: each flight touches only its handful of candidate
@@ -260,6 +265,16 @@ def build_formulation(
                 ub[row] = 0.0
                 row += 1
 
+    if max_moved_flights is not None:
+        # A flight is unmoved exactly when its original-bucket variable is 1.
+        # Therefore sum(unmoved) >= n - max_moved_flights is a linear
+        # constraint and needs no additional binary variables.
+        for f in flights:
+            A[row, pos[("x", f.flight_id, f.original_bucket)]] = 1.0
+        lb[row] = max(0, len(flights) - max_moved_flights)
+        ub[row] = np.inf
+        row += 1
+
     A = A.tocsr()
     var_lb = np.zeros(n_vars)
     var_ub = np.ones(n_vars)
@@ -294,12 +309,14 @@ def solve_departure_bank(
     mode: Literal["expected", "risk_averse"] = "expected",
     risk_alpha: float = 0.2,
     backend: OptimizationBackend | None = None,
+    max_moved_flights: int | None = None,
 ) -> DepartureBankResult:
     backend = backend or PublicBackend()
     formulation, meta = build_formulation(
         flights, n_buckets, allowed_shift_minutes, preferred_bank_limit,
         congestion_weight_by_bucket, congestion_weighting, shift_penalty_weight, mode,
         bucket_delay_point_estimate, bucket_delay_scenarios, scenario_probs, risk_alpha,
+        max_moved_flights=max_moved_flights,
     )
     solution = backend.solve(formulation)
 
@@ -308,8 +325,9 @@ def solve_departure_bank(
         original_load[f.original_bucket] = original_load.get(f.original_bucket, 0) + 1
 
     if not solution.success:
+        failure_status = solution.status if solution.status in {"time_limit", "error"} else "infeasible"
         return DepartureBankResult(
-            status="infeasible", mode=mode, assignments=[], original_bank_load=original_load,
+            status=failure_status, mode=mode, assignments=[], original_bank_load=original_load,
             optimized_bank_load={}, original_peak_load=max(original_load.values(), default=0),
             optimized_peak_load=0, flights_moved=0, average_movement_minutes=0.0,
             objective_value=0.0, objective_decomposition={}, congestion_change=0.0,
@@ -404,6 +422,7 @@ def _methodology(mode: str) -> dict:
         ),
         "limitations": [
             "This reschedules WITHIN the existing flight set -- it does not add, cancel, or retime across carriers.",
+            "max_moved_flights limits schedule disruption, but crew legality, aircraft rotations, gates, slots, connections, and curfews require additional operational data not present in BTS.",
             "Delay proxies/scenarios are historical, bucket-level figures, not a causal prediction of what delay a specific flight would experience if actually moved there.",
             "Preferred bank limits default to this project's empirical effective_capacity, which is itself a proxy, not certified airport capacity.",
         ],

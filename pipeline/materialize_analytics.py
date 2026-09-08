@@ -1,0 +1,152 @@
+"""Build compact, warehouse-backed tables used by the dashboard.
+
+The raw ``flights`` table remains the source of truth.  These derived tables
+keep only the dimensions and metrics the website repeatedly asks for, which
+means the public pages do not need to rescan every raw column for every visit.
+They are deterministic and can always be rebuilt from ``flights``.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import duckdb
+
+from config import DUCKDB_FILE
+
+
+ANALYTICS_TABLES = (
+    "analytics_network_month",
+    "analytics_carrier_month",
+    "analytics_route_month",
+    "analytics_airport_month",
+    "analytics_route_hour",
+)
+
+
+def build_analytics_tables(connection: Any) -> dict[str, int]:
+    """Replace all dashboard aggregate tables and return their row counts."""
+    statements = {
+        "analytics_network_month": """
+            CREATE OR REPLACE TABLE analytics_network_month AS
+            SELECT
+                strftime(FlightDate, '%Y-%m') AS year_month,
+                COUNT(*) AS total_flights,
+                COUNT(*) FILTER (WHERE Cancelled = 0 AND ArrDelay IS NOT NULL) AS completed_flights,
+                AVG(CASE WHEN Cancelled = 0 THEN CASE WHEN ArrDel15 = 0 THEN 1.0 ELSE 0.0 END END) AS on_time_rate,
+                AVG(CASE WHEN Cancelled = 0 THEN ArrDelay END) AS avg_arrival_delay_minutes,
+                AVG(Cancelled * 1.0) AS cancellation_rate,
+                COUNT(DISTINCT Origin || '-' || Dest) AS unique_routes,
+                COUNT(DISTINCT Origin) + COUNT(DISTINCT Dest) AS airport_endpoint_count
+            FROM flights
+            WHERE FlightDate IS NOT NULL
+            GROUP BY year_month
+            ORDER BY year_month
+        """,
+        "analytics_carrier_month": """
+            CREATE OR REPLACE TABLE analytics_carrier_month AS
+            SELECT
+                Marketing_Airline_Network AS carrier,
+                strftime(FlightDate, '%Y-%m') AS year_month,
+                COUNT(*) AS total_flights,
+                COUNT(*) FILTER (WHERE Cancelled = 0 AND ArrDelay IS NOT NULL) AS completed_flights,
+                AVG(CASE WHEN Cancelled = 0 THEN CASE WHEN ArrDel15 = 0 THEN 1.0 ELSE 0.0 END END) AS on_time_rate,
+                AVG(CASE WHEN Cancelled = 0 THEN ArrDelay END) AS avg_arrival_delay_minutes,
+                AVG(Cancelled * 1.0) AS cancellation_rate
+            FROM flights
+            WHERE FlightDate IS NOT NULL AND Marketing_Airline_Network IS NOT NULL
+            GROUP BY Marketing_Airline_Network, year_month
+            ORDER BY carrier, year_month
+        """,
+        "analytics_route_month": """
+            CREATE OR REPLACE TABLE analytics_route_month AS
+            SELECT
+                Origin AS origin,
+                Dest AS dest,
+                strftime(FlightDate, '%Y-%m') AS year_month,
+                COUNT(*) AS total_flights,
+                COUNT(*) FILTER (WHERE Cancelled = 0 AND ArrDelay IS NOT NULL) AS completed_flights,
+                AVG(CASE WHEN Cancelled = 0 THEN CASE WHEN ArrDel15 = 0 THEN 1.0 ELSE 0.0 END END) AS on_time_rate,
+                AVG(CASE WHEN Cancelled = 0 THEN ArrDelay END) AS avg_arrival_delay_minutes,
+                AVG(Cancelled * 1.0) AS cancellation_rate,
+                MAX(Distance) AS distance_miles
+            FROM flights
+            WHERE FlightDate IS NOT NULL AND Origin IS NOT NULL AND Dest IS NOT NULL
+            GROUP BY Origin, Dest, year_month
+            ORDER BY origin, dest, year_month
+        """,
+        "analytics_airport_month": """
+            CREATE OR REPLACE TABLE analytics_airport_month AS
+            WITH airport_events AS (
+                SELECT
+                    Origin AS airport,
+                    strftime(FlightDate, '%Y-%m') AS year_month,
+                    'outbound' AS direction,
+                    Dest AS related_airport
+                FROM flights
+                WHERE FlightDate IS NOT NULL AND Origin IS NOT NULL
+                UNION ALL
+                SELECT
+                    Dest AS airport,
+                    strftime(FlightDate, '%Y-%m') AS year_month,
+                    'inbound' AS direction,
+                    Origin AS related_airport
+                FROM flights
+                WHERE FlightDate IS NOT NULL AND Dest IS NOT NULL
+            )
+            SELECT
+                airport,
+                year_month,
+                COUNT(*) FILTER (WHERE direction = 'outbound') AS outbound_flights,
+                COUNT(*) FILTER (WHERE direction = 'inbound') AS inbound_flights,
+                COUNT(*) AS total_flights,
+                COUNT(DISTINCT related_airport) AS unique_routes,
+                COUNT(DISTINCT year_month || '-' || related_airport) AS route_month_pairs
+            FROM airport_events
+            WHERE related_airport IS NOT NULL
+            GROUP BY airport, year_month
+            ORDER BY airport, year_month
+        """,
+        "analytics_route_hour": """
+            CREATE OR REPLACE TABLE analytics_route_hour AS
+            SELECT
+                Origin AS origin,
+                Dest AS dest,
+                Marketing_Airline_Network AS carrier,
+                CAST(FLOOR(CRSDepTime / 100) AS INTEGER) AS departure_hour,
+                COUNT(*) AS total_flights,
+                COUNT(*) FILTER (WHERE Cancelled = 0 AND ArrDelay IS NOT NULL) AS completed_flights,
+                AVG(CASE WHEN Cancelled = 0 THEN CASE WHEN ArrDel15 = 0 THEN 1.0 ELSE 0.0 END END) AS on_time_rate,
+                AVG(CASE WHEN Cancelled = 0 THEN ArrDelay END) AS avg_arrival_delay_minutes,
+                quantile_cont(ArrDelay, 0.50) FILTER (WHERE Cancelled = 0 AND ArrDelay IS NOT NULL) AS median_arrival_delay_minutes,
+                quantile_cont(ArrDelay, 0.90) FILTER (WHERE Cancelled = 0 AND ArrDelay IS NOT NULL) AS p90_arrival_delay_minutes,
+                AVG(Cancelled * 1.0) AS cancellation_rate
+            FROM flights
+            WHERE Origin IS NOT NULL AND Dest IS NOT NULL AND CRSDepTime IS NOT NULL
+            GROUP BY Origin, Dest, Marketing_Airline_Network, departure_hour
+            ORDER BY origin, dest, carrier, departure_hour
+        """,
+    }
+
+    counts: dict[str, int] = {}
+    for table_name in ANALYTICS_TABLES:
+        connection.execute(statements[table_name])
+        counts[table_name] = int(connection.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])
+    return counts
+
+
+def main() -> None:
+    """Refresh the compact dashboard tables in the configured warehouse."""
+    if not DUCKDB_FILE.exists():
+        raise SystemExit(f"Warehouse not found: {DUCKDB_FILE}")
+    connection = duckdb.connect(str(DUCKDB_FILE))
+    try:
+        counts = build_analytics_tables(connection)
+        for table_name, count in counts.items():
+            print(f"{table_name}: {count:,} rows")
+    finally:
+        connection.close()
+
+
+if __name__ == "__main__":
+    main()

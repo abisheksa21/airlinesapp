@@ -56,6 +56,7 @@ from config import RAW_DIR, CLEAN_DIR, LOG_DIR, DUCKDB_FILE, PIPELINE_STATE_FILE
 from pipeline.download import download_month, MONTH_NAMES
 from pipeline.clean import process_zip, parse_year_month, find_zip_files
 from pipeline import build_warehouse
+from pipeline.materialize_analytics import build_analytics_tables
 
 
 def setup_logging() -> logging.Logger:
@@ -173,7 +174,10 @@ def append_new_months_to_warehouse(cleaned_ok: list[tuple[int, int]], logger: lo
         return True
 
     connection = duckdb.connect(str(DUCKDB_FILE))
+    transaction_open = False
     try:
+        connection.execute("BEGIN TRANSACTION")
+        transaction_open = True
         for year, month in cleaned_ok:
             month_name = MONTH_NAMES.get(month, str(month))
             clean_path = CLEAN_DIR / f"OTP_{year}_{month:02d}_{month_name}.csv"
@@ -188,15 +192,28 @@ def append_new_months_to_warehouse(cleaned_ok: list[tuple[int, int]], logger: lo
                 "SELECT COUNT(*) FROM flights WHERE strftime(FlightDate, '%Y-%m') = ?",
                 [f"{year}-{month:02d}"],
             ).fetchone()[0]
-            if already_present > 0:
+
+            expected_count = connection.execute(
+                "SELECT COUNT(*) FROM read_csv_auto(?, union_by_name=true, header=true)",
+                [str(clean_path)],
+            ).fetchone()[0]
+            if expected_count <= 0:
+                raise RuntimeError(f"Cleaned {year}-{month:02d} file is empty; refusing to update the warehouse.")
+            if already_present == expected_count:
                 logger.warning(
                     "%s %d already has %d rows in the warehouse -- skipping append to avoid duplicates.",
                     month_name, year, already_present,
                 )
                 continue
+            if already_present > 0:
+                raise RuntimeError(
+                    f"Warehouse contains a partial {year}-{month:02d} month "
+                    f"({already_present:,} rows vs {expected_count:,} cleaned rows); "
+                    "refusing to append duplicates. Rebuild or repair the warehouse first."
+                )
 
             connection.execute(
-                "INSERT INTO flights SELECT * FROM read_csv_auto(?, union_by_name=true, header=true)",
+                "INSERT INTO flights BY NAME SELECT * FROM read_csv_auto(?, union_by_name=true, header=true)",
                 [str(clean_path)],
             )
             new_row_count = connection.execute(
@@ -206,11 +223,20 @@ def append_new_months_to_warehouse(cleaned_ok: list[tuple[int, int]], logger: lo
             logger.info("Appended %s %d: %s rows.", month_name, year, f"{new_row_count:,}")
 
         total = connection.execute("SELECT COUNT(*) FROM flights").fetchone()[0]
+        analytics_counts = build_analytics_tables(connection)
+        connection.execute("COMMIT")
+        transaction_open = False
         logger.info("Warehouse now has %s total rows.", f"{total:,}")
+        logger.info("Analytics tables refreshed: %s", analytics_counts)
         return True
     except Exception as exc:
+        if transaction_open:
+            try:
+                connection.execute("ROLLBACK")
+            except Exception:
+                pass
         logger.error(
-            "Incremental append failed: %s: %s -- warehouse may be in a partial state; "
+            "Incremental append failed: %s: %s -- transaction rolled back; "
             "consider running python -m pipeline.build_warehouse to do a clean full rebuild.",
             type(exc).__name__, exc,
         )

@@ -189,7 +189,9 @@ host you picked). This keeps the deployed site's data fresh without solving
   limit becomes (per-process limit x process count). Solving that properly
   needs a shared store (Redis, etc.) -- not built, since it's real
   infrastructure this doesn't need yet.
-- **No auth on any endpoint.** Fine for a public read-only research site.
+- **No auth on read-only analytics endpoints.** The warehouse-writing
+  `/api/admin/check-for-updates` endpoint now requires `PIPELINE_ADMIN_TOKEN`
+  in production and should be invoked only by a private operator/scheduler.
   Would matter if this ever needs to distinguish who's asking.
 - **The persistent-disk warehouse upload is manual**, not automated. A
   scripted sync (steps 4 -> host) is a reasonable next improvement once the

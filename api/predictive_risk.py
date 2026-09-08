@@ -48,6 +48,7 @@ from typing import Any
 import numpy as np
 
 from api.db import open_readonly_connection
+from api.metrics import COMPLETED_FLIGHT_SQL, SEVERE_DELAY_SQL
 
 # Training the panel model (query + build examples + fit logistic regression
 # + Platt calibration) is the expensive part of a request -- and it's the
@@ -420,15 +421,16 @@ def _query_monthly_entity_rows(
             {entity_sql} AS entity,
             strftime(FlightDate, '%Y-%m') AS period,
             COUNT(*) AS flight_volume,
-            AVG(CASE WHEN Cancelled = 0 AND Diverted = 0 AND ArrDelay >= 60 THEN 1.0 ELSE 0.0 END) AS severe_delay_rate,
+            AVG(CASE WHEN {SEVERE_DELAY_SQL} THEN 1.0 WHEN {COMPLETED_FLIGHT_SQL} THEN 0.0 END) AS severe_delay_rate,
             AVG(CASE WHEN Cancelled = 1 THEN 1.0 ELSE 0.0 END) AS cancellation_rate,
-            AVG(CASE WHEN Cancelled = 0 THEN DepDelay END) AS average_departure_delay,
-            SUM(COALESCE(LateAircraftDelay, 0)) / NULLIF(SUM(GREATEST(COALESCE(ArrDelay, 0), 0)), 0) AS late_aircraft_delay_share,
+            AVG(CASE WHEN {COMPLETED_FLIGHT_SQL} THEN DepDelay END) AS average_departure_delay,
+            SUM(CASE WHEN {COMPLETED_FLIGHT_SQL} THEN COALESCE(LateAircraftDelay, 0) ELSE 0 END)
+                / NULLIF(SUM(CASE WHEN {COMPLETED_FLIGHT_SQL} THEN GREATEST(COALESCE(ArrDelay, 0), 0) ELSE 0 END), 0) AS late_aircraft_delay_share,
             -- Despite the name, this is taxi time as a fraction of flight
             -- duration, not excess/congestion-caused delay -- see the
             -- caveat where this column feeds build_supervised_examples.
-            AVG(
-                CASE WHEN Cancelled = 0 AND TaxiOut IS NOT NULL AND TaxiIn IS NOT NULL AND ActualElapsedTime > 0
+                AVG(
+                    CASE WHEN {COMPLETED_FLIGHT_SQL} AND TaxiOut IS NOT NULL AND TaxiIn IS NOT NULL AND ActualElapsedTime > 0
                      THEN (TaxiOut + TaxiIn) * 1.0 / ActualElapsedTime END
             ) AS ground_delay_share
         FROM flights

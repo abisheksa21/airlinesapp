@@ -48,6 +48,7 @@ from typing import Any
 from scipy import stats as scipy_stats
 
 from api.db import open_readonly_connection
+from api.metrics import COMPLETED_FLIGHT_SQL, ON_TIME_FLAG_SQL, SEVERE_DELAY_SQL
 
 MINIMUM_FLIGHTS_FOR_FULL_CONFIDENCE = 30
 Z_95 = scipy_stats.norm.ppf(0.975)
@@ -76,19 +77,17 @@ def _get_rating(score: float) -> str:
 #: api/main.py's network-protection-portfolio endpoint, which previously
 #: issued one full-table-scan query per candidate (N sequential scans over
 #: 60.7M rows) instead of one grouped scan.
-RAW_STAT_SELECT_EXPRS = """
+RAW_STAT_SELECT_EXPRS = f"""
     COUNT(*) AS total_flights,
-    SUM(CASE WHEN Cancelled = 0 AND Diverted = 0 AND ArrDelay IS NOT NULL THEN 1 ELSE 0 END) AS completed_flights,
-    AVG(CASE WHEN Cancelled = 0 AND Diverted = 0 AND ArrDelay IS NOT NULL THEN ArrDelay END) AS avg_arrival_delay,
-    VAR_POP(CASE WHEN Cancelled = 0 AND Diverted = 0 AND ArrDelay IS NOT NULL THEN ArrDelay END) AS var_arrival_delay,
-    AVG(CASE WHEN Cancelled = 0 AND Diverted = 0 AND ArrDelay IS NOT NULL
-        THEN CASE WHEN ArrDelay <= 15 THEN 1.0 ELSE 0.0 END END) * 100 AS on_time_percentage,
-    VAR_POP(CASE WHEN Cancelled = 0 AND Diverted = 0 AND ArrDelay IS NOT NULL
-        THEN CASE WHEN ArrDelay <= 15 THEN 1.0 ELSE 0.0 END END) AS var_on_time_indicator,
-    AVG(CASE WHEN Cancelled = 0 AND Diverted = 0 AND ArrDelay IS NOT NULL
-        THEN CASE WHEN ArrDelay > 60 THEN 1.0 ELSE 0.0 END END) * 100 AS severe_delay_percentage,
-    VAR_POP(CASE WHEN Cancelled = 0 AND Diverted = 0 AND ArrDelay IS NOT NULL
-        THEN CASE WHEN ArrDelay > 60 THEN 1.0 ELSE 0.0 END END) AS var_severe_indicator,
+    SUM(CASE WHEN {COMPLETED_FLIGHT_SQL} THEN 1 ELSE 0 END) AS completed_flights,
+    AVG(CASE WHEN {COMPLETED_FLIGHT_SQL} THEN ArrDelay END) AS avg_arrival_delay,
+    VAR_POP(CASE WHEN {COMPLETED_FLIGHT_SQL} THEN ArrDelay END) AS var_arrival_delay,
+    AVG(CASE WHEN {COMPLETED_FLIGHT_SQL}
+        THEN CASE WHEN {ON_TIME_FLAG_SQL} THEN 1.0 ELSE 0.0 END END) * 100 AS on_time_percentage,
+    VAR_POP(CASE WHEN {COMPLETED_FLIGHT_SQL}
+        THEN CASE WHEN {ON_TIME_FLAG_SQL} THEN 1.0 ELSE 0.0 END END) AS var_on_time_indicator,
+    AVG(CASE WHEN {SEVERE_DELAY_SQL} THEN 1.0 WHEN {COMPLETED_FLIGHT_SQL} THEN 0.0 END) * 100 AS severe_delay_percentage,
+    VAR_POP(CASE WHEN {SEVERE_DELAY_SQL} THEN 1.0 WHEN {COMPLETED_FLIGHT_SQL} THEN 0.0 END) AS var_severe_indicator,
     AVG(Cancelled) * 100 AS cancellation_percentage,
     VAR_POP(CAST(Cancelled AS DOUBLE)) AS var_cancelled_indicator,
     AVG(Diverted) * 100 AS diversion_percentage,
