@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useEffect, useRef, useState } from "react";
 import { useMode, type SiteMode } from "../lib/mode";
 
 const PUBLIC_LINKS = [
@@ -11,20 +12,34 @@ const PUBLIC_LINKS = [
   { href: "/routes", label: "Routes" },
 ];
 
-const RESEARCH_LINKS = [
-  { href: "/", label: "Workspace" },
-  { href: "/carriers", label: "Carriers" },
-  { href: "/airports", label: "Airports" },
-  { href: "/routes", label: "Routes" },
-  { href: "/decision-center", label: "Decision Center" },
-  { href: "/capacity", label: "T-100" },
-  { href: "/compare", label: "Compare" },
-  { href: "/delays", label: "Delay causes" },
-  { href: "/aircraft", label: "Aircraft" },
-  { href: "/max-grounding", label: "MAX" },
-  { href: "/data-health", label: "Data health" },
-  { href: "/methodology", label: "Methodology" },
-  { href: "/copilot", label: "Copilot" },
+const RESEARCH_GROUPS = [
+  {
+    label: "Explore",
+    links: [
+      { href: "/carriers", label: "Carriers" },
+      { href: "/airports", label: "Airports" },
+      { href: "/routes", label: "Routes" },
+      { href: "/aircraft", label: "Aircraft" },
+    ],
+  },
+  {
+    label: "Analyze",
+    links: [
+      { href: "/decision-center", label: "Decision Center" },
+      { href: "/capacity", label: "T-100" },
+      { href: "/compare", label: "Compare" },
+      { href: "/delays", label: "Delay causes" },
+      { href: "/max-grounding", label: "MAX grounding" },
+    ],
+  },
+  {
+    label: "Reference",
+    links: [
+      { href: "/data-health", label: "Data health" },
+      { href: "/methodology", label: "Methodology" },
+      { href: "/copilot", label: "Copilot" },
+    ],
+  },
 ];
 
 function isActive(pathname: string, href: string): boolean {
@@ -63,16 +78,66 @@ function PublicNav({ pathname, setMode }: { pathname: string; setMode: (mode: Si
 }
 
 function ResearchNav({ pathname, setMode }: { pathname: string; setMode: (mode: SiteMode) => void }) {
+  const [openMenu, setOpenMenu] = useState<string | null>(null);
+  const navRef = useRef<HTMLElement>(null);
+
+  useEffect(() => {
+    function closeOnOutsideClick(event: PointerEvent) {
+      if (navRef.current && !navRef.current.contains(event.target as Node)) setOpenMenu(null);
+    }
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") setOpenMenu(null);
+    }
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsideClick);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, []);
+
   return (
     <>
-      <nav className="research-navigation" aria-label="Research navigation">
+      <nav ref={navRef} className="research-navigation" aria-label="Research navigation">
         <Link href="/" className="research-brand">
           <span className="research-brand-mark">✦</span>
           <span><strong>Airline Ops</strong><small>Research console</small></span>
         </Link>
         <div className="research-nav-title"><span>OPERATIONS INTELLIGENCE</span><strong>Question → evidence → decision</strong></div>
         <div className="research-nav-links">
-          {RESEARCH_LINKS.map((link) => <Link key={link.href} href={link.href} className={isActive(pathname, link.href) ? "active" : ""}>{link.label}</Link>)}
+          <Link href="/" className={isActive(pathname, "/") ? "active" : ""}>Workspace</Link>
+          {RESEARCH_GROUPS.map((group) => {
+            const groupIsActive = group.links.some((link) => isActive(pathname, link.href));
+            const menuId = `research-menu-${group.label.toLowerCase()}`;
+            return (
+              <div className="research-nav-group" key={group.label}>
+                <button
+                  type="button"
+                  className={`research-nav-group-button ${groupIsActive ? "active" : ""}`}
+                  aria-expanded={openMenu === group.label}
+                  aria-controls={menuId}
+                  onClick={() => setOpenMenu(openMenu === group.label ? null : group.label)}
+                >
+                  <span>{group.label}</span><span className="research-nav-chevron" aria-hidden="true">⌄</span>
+                </button>
+                {openMenu === group.label && (
+                  <div className="research-nav-menu" id={menuId} role="menu" aria-label={`${group.label} pages`}>
+                    {group.links.map((link) => (
+                      <Link
+                        key={link.href}
+                        href={link.href}
+                        role="menuitem"
+                        className={isActive(pathname, link.href) ? "active" : ""}
+                        onClick={() => setOpenMenu(null)}
+                      >
+                        {link.label}
+                      </Link>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
         <button type="button" className="research-public-button" onClick={() => setMode("public")}>
           <span className="research-live-dot" />Public view

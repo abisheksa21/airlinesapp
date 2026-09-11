@@ -5,6 +5,7 @@ import Link from "next/link";
 import { formatNumber } from "../lib/format";
 import CarrierChart from "../components/CarrierChart";
 import DateRangePreset from "../components/DateRangePreset";
+import PublicPageGuide from "../components/PublicPageGuide";
 import { CARRIER_NAMES, carrierName } from "../lib/carriers";
 import { useMode } from "../lib/mode";
 
@@ -84,6 +85,14 @@ export default function CarriersPage() {
           ? "Start with the network ranking, then use the evidence table to choose a carrier profile or a question for the Decision Center."
           : "A simple comparison of airline reliability, with a quick path into each carrier profile."}</p>
       </header>
+
+      {mode === "public" && (
+        <PublicPageGuide
+          topic="carriers"
+          explanation="Compare the height of each bar first, then open a carrier profile to see the delays, cancellations, and monthly pattern behind it."
+          note="Higher bar = more flights arriving within 15 minutes of schedule."
+        />
+      )}
 
       <section className="section">
         <div className="section-head">

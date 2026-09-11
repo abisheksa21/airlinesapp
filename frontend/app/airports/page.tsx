@@ -5,6 +5,7 @@ import Link from "next/link";
 import { formatNumber } from "../lib/format";
 import AirportChart from "../components/AirportChart";
 import DateRangePreset from "../components/DateRangePreset";
+import PublicPageGuide from "../components/PublicPageGuide";
 import { useMode } from "../lib/mode";
 import { airportDisplayName } from "../lib/airports";
 
@@ -90,6 +91,14 @@ export default function AirportsPage() {
           ? "Use volume to find the network hubs, then open an airport profile to inspect its inbound, outbound, delay, and route evidence."
           : "Find the busiest gateways, then open an airport profile for the story behind the number."}</p>
       </header>
+
+      {mode === "public" && (
+        <PublicPageGuide
+          topic="airports"
+          explanation="Use volume to find the network’s busiest gateways, then open a profile to separate inbound and outbound performance."
+          note="Volume shows observed activity; it is not a certified capacity limit."
+        />
+      )}
 
       <section className="section">
         <div className="section-head">

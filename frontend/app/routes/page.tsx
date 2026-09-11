@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import RouteChart from "../components/RouteChart";
 import DateRangePreset from "../components/DateRangePreset";
+import PublicPageGuide from "../components/PublicPageGuide";
 import { Health } from "../lib/health";
 import TrendChart from "../components/TrendChart";
 import DelayCauseChart from "../components/DelayCauseChart";
@@ -155,6 +156,14 @@ export default function RoutesPage() {
           ? "Trace a network signal from the busiest directional connections into route-level delay, carrier, diversion, and expected-outcome evidence."
           : "See the busiest connections and check the historical pattern for a route you care about."}</p>
       </header>
+
+      {mode === "public" && (
+        <PublicPageGuide
+          topic="routes"
+          explanation="A route is directional: LAX → SFO is different from SFO → LAX. Start with busy connections, then test one route below."
+          note="Bar color = historical on-time rate for that directional connection."
+        />
+      )}
 
       <section className="section">
         <div className="section-head">
@@ -389,25 +398,25 @@ export default function RoutesPage() {
           <div className="route-lookup-row">
             <label className="filter-field">
               <span className="filter-label">Origin</span>
-              <input
-                type="text"
+              <select
                 value={forecastOrigin}
-                onChange={(e) => setForecastOrigin(e.target.value.toUpperCase())}
-                placeholder="e.g. ATL"
-                maxLength={3}
+                onChange={(e) => setForecastOrigin(e.target.value)}
                 aria-label="Forecast origin airport"
-              />
+              >
+                <option value="">Select airport</option>
+                {airports.map((airport) => <option key={airport} value={airport}>{airport}</option>)}
+              </select>
             </label>
             <label className="filter-field">
               <span className="filter-label">Destination</span>
-              <input
-                type="text"
+              <select
                 value={forecastDest}
-                onChange={(e) => setForecastDest(e.target.value.toUpperCase())}
-                placeholder="e.g. LAX"
-                maxLength={3}
+                onChange={(e) => setForecastDest(e.target.value)}
                 aria-label="Forecast destination airport"
-              />
+              >
+                <option value="">Select airport</option>
+                {airports.map((airport) => <option key={airport} value={airport}>{airport}</option>)}
+              </select>
             </label>
             <label className="filter-field">
               <span className="filter-label">Airline (optional)</span>

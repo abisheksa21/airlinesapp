@@ -132,67 +132,80 @@ export default function CapacityPage() {
   }
 
   return (
-    <main className="page">
-      <header className="header research-hero">
-        <p className="eyebrow">Researcher view · BTS T-100 + OTP</p>
-        <h1 className="title">Traffic context for on-time performance.</h1>
-        <p className="subtitle">
-          T-100 tells us how many seats and passengers moved on a route each month.
-          This page checks whether that traffic context moves with the same month&apos;s on-time result.
-        </p>
-        <div className="hero-actions">
-          <span className="status-chip"><span className="status-chip-dot" /> Evidence surface</span>
-          <Link href="/methodology#t-100-and-on-time-correlation" className="text-link">Read the full method →</Link>
+    <main className="page capacity-researcher-page">
+      <header className="header research-hero capacity-console-header">
+        <div className="capacity-console-lede">
+          <p className="eyebrow">Researcher view · BTS T-100 + OTP</p>
+          <h1 className="title">Traffic context for on-time performance.</h1>
+          <p className="subtitle">
+            T-100 adds seats and passengers to the on-time record. Use this console to check whether fuller route-months move with the same month&apos;s on-time result.
+          </p>
+        </div>
+        <div className="capacity-console-meta">
+          <div className="hero-actions">
+            <span className="status-chip"><span className="status-chip-dot" /> Evidence surface</span>
+            <Link href="/methodology#t-100-and-on-time-correlation" className="text-link">Read the full method →</Link>
+          </div>
+          <div className="capacity-meta-list" aria-label="Capacity analysis scope">
+            <div><span>Source</span><strong>BTS T-100 + OTP</strong></div>
+            <div><span>Analysis grain</span><strong>Carrier · route · month</strong></div>
+          </div>
         </div>
       </header>
 
-      <section className="capacity-explainer">
+      <section className="capacity-explainer capacity-question-bar">
         <div>
           <p className="eyebrow">The question</p>
           <h2>Does a fuller route look different operationally?</h2>
         </div>
         <p>
-          We compare the two datasets at the same level: <strong>carrier + route + month</strong>.
-          The result is an association to investigate, not a claim that passenger demand causes delay.
+          We line up both datasets by <strong>carrier + route + month</strong>. The result is an association to investigate, not a claim that passenger demand causes delay.
         </p>
       </section>
 
-      <section className="capacity-reading-guide" aria-label="How to read the T-100 comparison">
-        <div><span>01</span><strong>Traffic context</strong><p>T-100 tells us how many seats and passengers were offered on a route each month.</p></div>
-        <div><span>02</span><strong>Operating outcome</strong><p>OTP tells us how often the matched flights arrived on time.</p></div>
-        <div><span>03</span><strong>Relationship</strong><p>The comparison shows whether the two measures move together. It is not proof of cause.</p></div>
-      </section>
-
-      <section className="section">
+      <section className="section capacity-workbench">
         <div className="section-head">
-          <h2 className="section-title">Choose the evidence slice</h2>
-          <span className="section-note">No synthetic traffic values</span>
+          <div>
+            <p className="eyebrow">01 · Define evidence</p>
+            <h2 className="section-title">Choose the evidence slice</h2>
+          </div>
+          <span className="section-note">Live local warehouse · no synthetic traffic values</span>
         </div>
         <div className="screen capacity-controls">
-          <label className="filter-field">
+          <label className="filter-field capacity-carrier-field">
             <span className="filter-label">Airline (optional)</span>
             <select value={carrier} onChange={(event) => setCarrier(event.target.value)}>
               <option value="">All carriers</option>
               {CARRIER_CODES.map((code) => <option key={code} value={code}>{code} — {carrierName(code)}</option>)}
             </select>
           </label>
-          <label className="filter-field">
+          <label className="filter-field capacity-threshold-field">
             <span className="filter-label">Minimum OTP flights per route-month</span>
             <input type="number" min="1" max="10000" value={minimumFlights} onChange={(event) => setMinimumFlights(event.target.value)} />
           </label>
           <button type="button" className="compare-run" onClick={() => void load()} disabled={loading}>
             {loading ? "Loading evidence…" : "Refresh comparison"}
           </button>
+          <p className="capacity-control-hint">The threshold is a confidence control: higher values keep only route-months with more OTP observations.</p>
+        </div>
+        <div className="capacity-scope-strip" aria-label="Current evidence scope">
+          <div><span>Source</span><strong>BTS on-time records + T-100</strong></div>
+          <div><span>Unit of comparison</span><strong>Carrier · route · month</strong></div>
+          <div><span>Current threshold</span><strong>{minimumFlights} OTP flights</strong></div>
         </div>
       </section>
 
       {error && <div className="callout callout-warn">{error}</div>}
+      {loading && !result && <div className="screen capacity-loading-panel"><span className="status-chip-dot" /><div><strong>Reading matched T-100 and OTP history</strong><p>The first result will appear here when the warehouse query finishes.</p></div></div>}
 
       {result && (
         <>
-          <section className="section">
+          <section className="section capacity-result-section">
             <div className="section-head">
-              <h2 className="section-title">What the matched history says</h2>
+              <div>
+                <p className="eyebrow">02 · Read output</p>
+                <h2 className="section-title">What the matched history says</h2>
+              </div>
               <span className="section-note">{periodLabel(result.overview.first_period)} → {periodLabel(result.overview.last_period)}</span>
             </div>
             <div className="board capacity-board">
@@ -208,9 +221,18 @@ export default function CapacityPage() {
             </div>
           </section>
 
+          <section className="capacity-reading-guide" aria-label="How to read the T-100 comparison">
+            <div><span>01</span><strong>Traffic context</strong><p>T-100 tells us how many seats and passengers were offered on a route each month.</p></div>
+            <div><span>02</span><strong>Operating outcome</strong><p>OTP tells us how often the matched flights arrived on time.</p></div>
+            <div><span>03</span><strong>Relationship</strong><p>The comparison shows whether the two measures move together. It is not proof of cause.</p></div>
+          </section>
+
           <section className="section">
             <div className="section-head">
-              <h2 className="section-title">Traffic context over time</h2>
+              <div>
+                <p className="eyebrow">03 · Find the pattern</p>
+                <h2 className="section-title">Traffic context over time</h2>
+              </div>
               <span className="section-note">same matched history</span>
             </div>
             <div className="screen capacity-trend-screen">
@@ -226,7 +248,10 @@ export default function CapacityPage() {
 
           <section className="section">
             <div className="section-head">
-              <h2 className="section-title">Largest matched route-months</h2>
+              <div>
+                <p className="eyebrow">04 · Inspect rows</p>
+                <h2 className="section-title">Largest matched route-months</h2>
+              </div>
               <span className="section-note">Sorted by passengers</span>
             </div>
             <div className="screen table-screen">
