@@ -243,6 +243,12 @@ export default function DecisionCenterPage() {
             The public brief is designed to explain the network quickly. This workspace is for comparing carriers,
             checking next-month risk, testing bounded schedule changes, and connecting T-100 traffic with on-time outcomes.
           </p>
+          <div className="public-decision-lanes">
+            <div><span>01 / PERFORMANCE</span><strong>Compare what happened</strong><p>Find the carriers, airports, and routes worth a closer look.</p></div>
+            <div><span>02 / CAPACITY</span><strong>Read traffic context</strong><p>See whether fuller route-months move with reliability.</p></div>
+            <div><span>03 / SCHEDULE</span><strong>Test a bounded change</strong><p>Explore whether a small shift could reduce a busy period.</p></div>
+            <div><span>04 / NETWORK</span><strong>Find structural bridges</strong><p>Separate the busiest hubs from airports that connect the network.</p></div>
+          </div>
           <div className="researcher-gate-actions">
             <button type="button" className="primary-action" onClick={() => setMode("researcher")}>Open researcher workspace <span>→</span></button>
             <Link href="/methodology#decision-center-methodology" className="secondary-action">Read the method first</Link>

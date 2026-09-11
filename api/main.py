@@ -19,7 +19,7 @@ from api.copilot import get_trend as copilot_get_trend
 from api.copilot import compare_carriers as copilot_compare_carriers
 from api.copilot import get_delay_causes as copilot_get_delay_causes
 from api.db import database_path, open_readonly_connection
-from config import DEFAULT_HEAVY_LOOKBACK_DAYS, DEFAULT_MODEL_LOOKBACK_DAYS, PIPELINE_STATE_FILE
+from config import DEFAULT_HEAVY_LOOKBACK_DAYS, DEFAULT_MODEL_LOOKBACK_DAYS, PIPELINE_STATE_FILE, T100_PIPELINE_STATE_FILE
 from api.metrics import COMPLETED_FLIGHT_SQL, ON_TIME_FLAG_SQL
 from api.analytics import airport_list, airport_ranking, carrier_ranking, network_summary, network_trend, route_hour_baseline, route_ranking
 from api import predictive_risk
@@ -45,6 +45,15 @@ _cors_origins_raw = os.getenv(
     "http://localhost:3000,http://127.0.0.1:3000",
 )
 CORS_ALLOWED_ORIGINS = [origin.strip() for origin in _cors_origins_raw.split(",") if origin.strip()]
+# Always permit the two local development origins.  Keeping these explicit
+# prevents a stale or empty environment variable from making a running local
+# frontend look like it has no data while the API itself is healthy.
+CORS_ALLOWED_ORIGINS = sorted(set(CORS_ALLOWED_ORIGINS + [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:3100",
+    "http://127.0.0.1:3100",
+]))
 
 app.add_middleware(
     CORSMiddleware,
@@ -60,6 +69,7 @@ app.add_middleware(
 # single-process local dev server, not a multi-worker deployment.
 _update_check_lock = threading.Lock()
 _update_check_running = False
+_t100_update_running = False
 
 
 def _run_auto_update_in_background():
@@ -88,11 +98,38 @@ def check_for_updates():
     afterward (last_automated_check) to see the result once it finishes."""
     global _update_check_running
     with _update_check_lock:
-        if _update_check_running:
+        if _update_check_running or _t100_update_running:
             return {"status": "already_running"}
         _update_check_running = True
 
     thread = threading.Thread(target=_run_auto_update_in_background, daemon=True)
+    thread.start()
+    return {"status": "started"}
+
+
+def _run_t100_update_in_background():
+    global _t100_update_running
+    try:
+        from pipeline import auto_update_bts
+        auto_update_bts.main()
+    except Exception:
+        # The updater writes the detailed failure to its log and state file;
+        # this guard ensures the API never leaves its mutual-exclusion flag set.
+        pass
+    finally:
+        _t100_update_running = False
+
+
+@app.post("/api/admin/check-t100-for-updates", dependencies=[Depends(require_pipeline_admin)])
+def check_t100_for_updates():
+    """Start the T-100-only freshness check without blocking the API request."""
+    global _t100_update_running
+    with _update_check_lock:
+        if _update_check_running or _t100_update_running:
+            return {"status": "already_running"}
+        _t100_update_running = True
+
+    thread = threading.Thread(target=_run_t100_update_in_background, daemon=True)
     thread.start()
     return {"status": "started"}
 
@@ -2945,6 +2982,7 @@ def airport_detail(
 def data_health():
     """Facts about the warehouse itself -- coverage, size, gaps -- so visitors
     can see the data is real and current rather than just trusting it blindly."""
+    bts_enrichment = {}
     with open_readonly_connection() as connection:
         overview = connection.execute(
             """
@@ -2983,6 +3021,83 @@ def data_health():
             "SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'flights'"
         ).fetchone()[0]
 
+        table_names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
+            ).fetchall()
+        }
+        view_names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT table_name FROM information_schema.views WHERE table_schema = 'main'"
+            ).fetchall()
+        }
+        manifest_by_dataset = {}
+        if "bts_dataset_manifest" in table_names:
+            manifest_by_dataset = {
+                row[0]: row[1:]
+                for row in connection.execute(
+                    """
+                    SELECT dataset, status, row_count, loaded_at_utc
+                    FROM bts_dataset_manifest
+                    """
+                ).fetchall()
+            }
+
+        for dataset_key, table_name, view_name in (
+            ("t100_segment", "bts_t100_segment", "bts_t100_segment_route_month"),
+            ("t100_market", "bts_t100_market", "bts_t100_market_route_month"),
+        ):
+            manifest = manifest_by_dataset.get(dataset_key)
+            if table_name not in table_names:
+                bts_enrichment[dataset_key] = {
+                    "status": "not_loaded",
+                    "table_name": table_name,
+                    "route_month_view": view_name,
+                    "rows": 0,
+                    "route_month_rows": 0,
+                    "months_covered": 0,
+                    "first_period": None,
+                    "last_period": None,
+                    "loaded_at_utc": str(manifest[2]) if manifest and manifest[2] else None,
+                }
+                continue
+
+            stats = connection.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS rows,
+                    COUNT(DISTINCT Year * 100 + Month) AS months_covered,
+                    MIN(Year * 100 + Month) AS first_period,
+                    MAX(Year * 100 + Month) AS last_period
+                FROM {table_name}
+                """
+            ).fetchone()
+            route_month_rows = (
+                connection.execute(f"SELECT COUNT(*) FROM {view_name}").fetchone()[0]
+                if view_name in view_names
+                else 0
+            )
+
+            def period_label(value):
+                if value is None:
+                    return None
+                value = int(value)
+                return f"{value // 100:04d}-{value % 100:02d}"
+
+            bts_enrichment[dataset_key] = {
+                "status": manifest[0] if manifest else "loaded",
+                "table_name": table_name,
+                "route_month_view": view_name if view_name in view_names else None,
+                "rows": int(stats[0] or 0),
+                "route_month_rows": int(route_month_rows or 0),
+                "months_covered": int(stats[1] or 0),
+                "first_period": period_label(stats[2]),
+                "last_period": period_label(stats[3]),
+                "loaded_at_utc": str(manifest[2]) if manifest and manifest[2] else None,
+            }
+
     # Find any gaps in monthly coverage between the first and last month present.
     start = datetime.strptime(str(overview[1]), "%Y-%m-%d")
     end = datetime.strptime(str(overview[2]), "%Y-%m-%d")
@@ -3010,6 +3125,13 @@ def data_health():
     except (json.JSONDecodeError, OSError):
         pipeline_state = None
 
+    t100_pipeline_state = None
+    try:
+        if T100_PIPELINE_STATE_FILE.exists():
+            t100_pipeline_state = json.loads(T100_PIPELINE_STATE_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        t100_pipeline_state = None
+
     return {
         "total_flights": overview[0],
         "start_date": str(overview[1]),
@@ -3019,6 +3141,7 @@ def data_health():
         "expected_months": len(expected_months),
         "missing_months": missing_months,
         "column_count": column_count,
+        "bts_enrichment": bts_enrichment,
         "warehouse_size_mb": warehouse_size_mb,
         "last_automated_check": (
             {
@@ -3027,6 +3150,16 @@ def data_health():
                 "months_added": pipeline_state.get("last_months_added", []),
             }
             if pipeline_state
+            else None
+        ),
+        "last_t100_check": (
+            {
+                "checked_at": t100_pipeline_state.get("checked_at"),
+                "result": t100_pipeline_state.get("result"),
+                "months_added": t100_pipeline_state.get("months_added", []),
+                "datasets": t100_pipeline_state.get("datasets", {}),
+            }
+            if t100_pipeline_state
             else None
         ),
         "carriers": [
@@ -3359,6 +3492,125 @@ def capacity_correlation(
             "interpretation": "This does not prove that fuller flights cause delays. Route mix, season, weather, airport congestion, and carrier scheduling can affect both measurements.",
             "join_policy": "T-100 monthly aggregates are matched to OTP after OTP is aggregated to the same carrier/route/month grain; monthly T-100 values are never copied onto individual flight rows.",
             "missing_data": "Only matched route-months with at least the requested number of OTP flights are included.",
+        },
+    }
+
+
+@app.get("/api/capacity/trend")
+def capacity_trend(
+    carrier: Optional[str] = Query(None),
+    minimum_flights: int = Query(100, ge=1, le=10000),
+):
+    """Return a simple monthly T-100 + OTP trend at the matched grain.
+
+    The chart-facing endpoint keeps the same join policy as the correlation
+    endpoint, but aggregates the matched route-month rows by calendar month.
+    Load factor and on-time rate are recomputed from their underlying totals,
+    so large routes do not get the same weight as tiny routes by accident.
+    """
+    carrier_value = carrier.upper().strip() if isinstance(carrier, str) and carrier else None
+    carrier_clause = "AND Marketing_Airline_Network = ?" if carrier_value else ""
+    t100_clause = "WHERE UniqueCarrier = ?" if carrier_value else ""
+
+    with open_readonly_connection() as connection:
+        exists = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.views
+            WHERE table_name = 'bts_t100_segment_route_month'
+            """
+        ).fetchone()[0]
+        if not exists:
+            raise HTTPException(
+                status_code=503,
+                detail="BTS T-100 Segment is not loaded. Run the BTS enrichment download, clean, and load steps first.",
+            )
+
+        query = f"""
+            WITH otp_route_month AS (
+                SELECT
+                    Marketing_Airline_Network AS carrier,
+                    Origin,
+                    Dest,
+                    YEAR(FlightDate) AS Year,
+                    MONTH(FlightDate) AS Month,
+                    COUNT(*) AS otp_flights,
+                    SUM(CASE WHEN {COMPLETED_FLIGHT_SQL} THEN 1 ELSE 0 END) AS completed_flights,
+                    SUM(CASE WHEN {COMPLETED_FLIGHT_SQL} AND {ON_TIME_FLAG_SQL} THEN 1 ELSE 0 END) AS on_time_flights,
+                    SUM(CASE WHEN {COMPLETED_FLIGHT_SQL} THEN ArrDelay ELSE 0 END) AS delay_total
+                FROM flights
+                WHERE Marketing_Airline_Network IS NOT NULL
+                    {carrier_clause}
+                GROUP BY ALL
+                HAVING COUNT(*) >= ?
+            ), matched AS (
+                SELECT
+                    t.Year,
+                    t.Month,
+                    t.passengers,
+                    t.seats_available,
+                    t.departures_performed,
+                    o.otp_flights,
+                    o.completed_flights,
+                    o.on_time_flights,
+                    o.delay_total
+                FROM bts_t100_segment_route_month t
+                INNER JOIN otp_route_month o
+                    ON o.carrier = t.UniqueCarrier
+                    AND o.Origin = t.Origin
+                    AND o.Dest = t.Dest
+                    AND o.Year = t.Year
+                    AND o.Month = t.Month
+                {t100_clause}
+            )
+            SELECT
+                Year,
+                Month,
+                COUNT(*) AS route_months,
+                SUM(otp_flights) AS otp_flights,
+                SUM(completed_flights) AS completed_flights,
+                SUM(on_time_flights) AS on_time_flights,
+                SUM(passengers) AS passengers,
+                SUM(seats_available) AS seats_available,
+                SUM(departures_performed) AS departures_performed,
+                SUM(delay_total) AS delay_total
+            FROM matched
+            GROUP BY Year, Month
+            ORDER BY Year, Month
+        """
+        params = [carrier_value, minimum_flights] if carrier_value else [minimum_flights]
+        if carrier_value:
+            params.append(carrier_value)
+        rows = connection.execute(query, params).fetchall()
+
+    months = []
+    for row in rows:
+        completed = row[4] or 0
+        seats = row[7] or 0
+        months.append(
+            {
+                "month": f"{int(row[0]):04d}-{int(row[1]):02d}",
+                "route_months": int(row[2] or 0),
+                "otp_flights": int(row[3] or 0),
+                "completed_flights": int(completed),
+                "passengers": row[6] or 0,
+                "seats_available": seats,
+                "departures_performed": row[8] or 0,
+                "load_factor": (row[6] / seats) if seats else None,
+                "on_time_rate": (row[5] / completed) if completed else None,
+                "avg_arrival_delay": (row[9] / completed) if completed else None,
+            }
+        )
+
+    return {
+        "status": "ok" if months else "no_matching_months",
+        "source": "BTS T-100 Domestic Segment + BTS Marketing Carrier On-Time Performance",
+        "grain": "monthly totals of matched carrier + route + month observations",
+        "filters": {"carrier": carrier_value, "minimum_otp_flights": minimum_flights},
+        "months": months,
+        "methodology": {
+            "interpretation": "Monthly totals show how traffic context and on-time performance moved together over time; they do not establish that one caused the other.",
+            "join_policy": "OTP is first aggregated to carrier/route/month, then matched to T-100 at that same grain.",
         },
     }
 

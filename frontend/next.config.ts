@@ -3,6 +3,9 @@ import path from "path";
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
+  // Allow a second local Next app to run beside another project without
+  // contending for the same development lockfile.
+  distDir: process.env.NEXT_DIST_DIR ?? ".next",
   allowedDevOrigins: ["127.0.0.1", "localhost"],
   // Keep production builds usable on small CI/deployment workers. The
   // default parallel page workers made this 16-route app peak above the

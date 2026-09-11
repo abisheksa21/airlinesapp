@@ -74,7 +74,7 @@ actually lives) before going further.
 ### Step 5: Start the backend
 
 ```powershell
-uvicorn api.main:app --reload
+python -m uvicorn api.main:app --reload --host 127.0.0.1 --port 8200
 ```
 
 Leave this running. Open a **second** terminal (`` Ctrl+Shift+` ``) for
@@ -88,9 +88,11 @@ Copy-Item .env.local.example .env.local
 npm install
 ```
 
-`.env.local` defaults to `http://127.0.0.1:8002` for this machine because
-port 8000 is already used by another local API service. The supplied
-`start_app.ps1` launcher starts AirlinesApp on that matching port.
+`.env.local` defaults to `http://127.0.0.1:8200` for this machine because
+ports 8000, 8002, 8003, and 8100 are used by other local API services. The supplied
+`start_app.ps1` launcher starts the frontend at `http://127.0.0.1:3100` and the
+API on that matching dedicated port. Port 3000 is reserved by another local app
+on this machine.
 
 ### Step 7: Start the frontend
 
@@ -98,8 +100,16 @@ port 8000 is already used by another local API service. The supplied
 npm run dev
 ```
 
-Visit `http://localhost:3000`. If this loads, both servers are up and
+Visit `http://localhost:3100`. If this loads, both servers are up and
 Part 2 can begin.
+
+For the normal one-command local workflow, run this instead from the project
+root (it starts the API in a separate PowerShell window and the frontend on
+the matching dedicated port):
+
+```powershell
+.\start_app.ps1
+```
 
 ---
 
@@ -148,7 +158,18 @@ their extra dimensions require it.
 the matched carrier/route/month count, average seats filled, average on-time
 rate, a plain-language relationship label, and a passenger-sorted table. The
 page must say “association” rather than “cause”; that distinction is part of
-the result, not a decorative disclaimer.
+the result, not a decorative disclaimer. Scroll to the monthly chart and
+confirm it shows the two simple output lines: seats filled and on-time rate.
+
+**The T-100 freshness check.** Open Researcher view → Data health and use
+“Check T-100 freshness”. The check should record the latest loaded month for
+both Segment and Market, stop cleanly when BTS has not published the next
+month, and never create a synthetic period. The same process can be run from
+the project root without the UI:
+
+```powershell
+python -m pipeline.auto_update_bts
+```
 
 **The on-time-rate fix (32 sites).** Pick any carrier or airport profile
 page, note the on-time rate shown. This should now correctly exclude

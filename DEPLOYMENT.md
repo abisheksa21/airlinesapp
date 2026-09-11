@@ -172,6 +172,12 @@ separate, harder problem than the rest of this deployment. Not solved here
 on purpose -- bundling it into a first deployment risks the whole thing
 stalling on the hardest 20%.
 
+The monthly T-100 enrichment has its own isolated updater for the same reason:
+run `python -m pipeline.auto_update_bts` locally. It checks Segment and Market
+against the latest period actually loaded in DuckDB, records the result in
+`Data/t100_pipeline_state.json`, reloads only the T-100 table when a verified
+ZIP is available, and leaves the flight-level OTP table untouched.
+
 **Keep running it locally** (Task Scheduler, as already set up). After each
 successful local run, push the updated `airline.duckdb` to wherever the
 backend's persistent disk lives (Render's dashboard file upload, or `scp`/

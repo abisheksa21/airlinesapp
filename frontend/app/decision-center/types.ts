@@ -119,6 +119,31 @@ export type CapacityCorrelationResult = {
   };
 };
 
+export type CapacityTrendPoint = {
+  month: string;
+  route_months: number;
+  otp_flights: number;
+  completed_flights: number;
+  passengers: number;
+  seats_available: number;
+  departures_performed: number;
+  load_factor: number | null;
+  on_time_rate: number | null;
+  avg_arrival_delay: number | null;
+};
+
+export type CapacityTrendResult = {
+  status: string;
+  source: string;
+  grain: string;
+  filters: { carrier: string | null; minimum_otp_flights: number };
+  months: CapacityTrendPoint[];
+  methodology: {
+    interpretation: string;
+    join_policy: string;
+  };
+};
+
 export type RiskResult = {
   entity_type: string;
   entity: string;

@@ -15,7 +15,20 @@ type PipelineCheck = {
   checked_at: string | null;
   result: string | null;
   months_added: string[];
+  datasets?: Record<string, { status?: string; latest_after?: string | null }>;
 } | null;
+
+type BtsEnrichment = {
+  status: string;
+  table_name: string;
+  route_month_view: string | null;
+  rows: number;
+  route_month_rows: number;
+  months_covered: number;
+  first_period: string | null;
+  last_period: string | null;
+  loaded_at_utc: string | null;
+};
 
 type DataHealth = {
   total_flights: number;
@@ -27,7 +40,9 @@ type DataHealth = {
   missing_months: string[];
   column_count: number;
   warehouse_size_mb: number | null;
+  bts_enrichment: Record<string, BtsEnrichment>;
   last_automated_check: PipelineCheck;
+  last_t100_check: PipelineCheck;
   carriers: CarrierRow[];
 };
 
@@ -77,6 +92,44 @@ export default async function DataHealthPage() {
 
       <section className="section">
         <div className="section-head">
+          <h2 className="section-title">BTS enrichment coverage</h2>
+          <Link href="/capacity" className="section-note">Open T-100 view →</Link>
+        </div>
+        <div className="screen">
+          <p className="health-detail">
+            T-100 is kept separate from the flight record because it is monthly
+            traffic data, not one row per flight. These checks confirm whether
+            the passenger and seat context is actually loaded before it is used.
+          </p>
+          <div className="enrichment-grid">
+            {Object.entries(health.bts_enrichment ?? {}).map(([key, source]) => (
+              <div className="enrichment-card" key={key}>
+                <div className="enrichment-card-heading">
+                  <strong>{key === "t100_segment" ? "T-100 Segment" : "T-100 Market"}</strong>
+                  <span className={source.status === "loaded" ? "health-ok" : "health-gap"}>
+                    {source.status === "loaded" ? "Loaded" : "Not loaded"}
+                  </span>
+                </div>
+                <p className="health-detail mono">
+                  {source.first_period ?? "—"} through {source.last_period ?? "—"}
+                  {" · "}{source.months_covered.toLocaleString()} months
+                </p>
+                <p className="health-detail mono">
+                  {source.rows.toLocaleString()} source rows · {source.route_month_rows.toLocaleString()} route-month rows
+                </p>
+              </div>
+            ))}
+          </div>
+          <p className="page-note">
+            The T-100 comparison joins after both datasets are aggregated to
+            carrier–route–month, so a monthly seat total is never copied onto
+            individual flights.
+          </p>
+        </div>
+      </section>
+
+      <section className="section">
+        <div className="section-head">
           <h2 className="section-title">Coverage status</h2>
         </div>
         <div className="screen">
@@ -101,10 +154,19 @@ export default async function DataHealthPage() {
 
       <section className="section">
         <div className="section-head">
-          <h2 className="section-title">Automated data check</h2>
+          <h2 className="section-title">Automated freshness checks</h2>
         </div>
-        <div className="screen">
-          <AutomatedCheckPanel initial={health.last_automated_check} />
+        <div className="freshness-grid">
+          <div className="screen freshness-panel">
+            <p className="eyebrow">Flight-level OTP</p>
+            <h3>On-time performance</h3>
+            <AutomatedCheckPanel initial={health.last_automated_check} />
+          </div>
+          <div className="screen freshness-panel">
+            <p className="eyebrow">Monthly enrichment</p>
+            <h3>T-100 capacity context</h3>
+            <AutomatedCheckPanel initial={health.last_t100_check} kind="t100" />
+          </div>
         </div>
       </section>
 

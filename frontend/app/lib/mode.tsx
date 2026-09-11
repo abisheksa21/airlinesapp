@@ -25,6 +25,10 @@ export function ModeProvider({ children }: { children: React.ReactNode }) {
   const [mode, setModeState] = useState<SiteMode>("public");
 
   useEffect(() => {
+    document.documentElement.dataset.siteMode = mode;
+  }, [mode]);
+
+  useEffect(() => {
     try {
       const stored = window.localStorage.getItem(STORAGE_KEY);
       if (stored === "researcher" || stored === "public") {
@@ -37,6 +41,7 @@ export function ModeProvider({ children }: { children: React.ReactNode }) {
 
   function setMode(next: SiteMode) {
     setModeState(next);
+    document.documentElement.dataset.siteMode = next;
     try {
       window.localStorage.setItem(STORAGE_KEY, next);
     } catch {

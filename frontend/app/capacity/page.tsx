@@ -4,10 +4,24 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import { CARRIER_NAMES, carrierName } from "../lib/carriers";
 import { formatInteger, formatNumber, formatPercent } from "../lib/format";
-import type { CapacityCorrelationResult } from "../decision-center/types";
+import type { CapacityCorrelationResult, CapacityTrendResult } from "../decision-center/types";
+import { useMode } from "../lib/mode";
+import CapacityTrendChart from "../components/CapacityTrendChart";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
 const CARRIER_CODES = Object.keys(CARRIER_NAMES);
+
+type CapacitySummaryResult = {
+  source: string;
+  overview: {
+    route_month_rows: number;
+    seats_available: number;
+    passengers: number;
+    load_factor: number | null;
+    first_year: number;
+    last_year: number;
+  };
+};
 
 function relationship(value: number | null): string {
   if (value === null || !Number.isFinite(value)) return "Not enough variation to say";
@@ -24,31 +38,98 @@ function periodLabel(value: number | null): string {
 }
 
 export default function CapacityPage() {
+  const { mode, setMode } = useMode();
   const [carrier, setCarrier] = useState("");
   const [minimumFlights, setMinimumFlights] = useState("100");
+  const [summary, setSummary] = useState<CapacitySummaryResult | null>(null);
   const [result, setResult] = useState<CapacityCorrelationResult | null>(null);
+  const [trend, setTrend] = useState<CapacityTrendResult | null>(null);
+  const [summaryLoading, setSummaryLoading] = useState(true);
   const [loading, setLoading] = useState(true);
+  const [trendLoading, setTrendLoading] = useState(true);
+  const [summaryError, setSummaryError] = useState("");
   const [error, setError] = useState("");
+  const [trendError, setTrendError] = useState("");
 
   async function load() {
+    if (mode === "public") {
+      setSummaryLoading(true);
+      setSummaryError("");
+      try {
+        const response = await fetch(`${API_BASE}/api/capacity/summary`);
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.detail ?? "The T-100 summary is unavailable.");
+        setSummary(payload);
+      } catch (cause) {
+        setSummary(null);
+        setSummaryError(cause instanceof Error ? cause.message : "The T-100 summary is unavailable.");
+      } finally {
+        setSummaryLoading(false);
+      }
+      return;
+    }
+
     setLoading(true);
+    setTrendLoading(true);
     setError("");
+    setTrendError("");
     const params = new URLSearchParams({ limit: "30", minimum_flights: minimumFlights });
     if (carrier) params.set("carrier", carrier);
     try {
-      const response = await fetch(`${API_BASE}/api/capacity/correlation?${params}`);
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.detail ?? "The T-100 comparison is unavailable.");
-      setResult(payload);
+      const trendParams = new URLSearchParams({ minimum_flights: minimumFlights });
+      if (carrier) trendParams.set("carrier", carrier);
+      const [comparisonResponse, trendResponse] = await Promise.all([
+        fetch(`${API_BASE}/api/capacity/correlation?${params}`),
+        fetch(`${API_BASE}/api/capacity/trend?${trendParams}`),
+      ]);
+      const comparisonPayload = await comparisonResponse.json();
+      const trendPayload = await trendResponse.json();
+      if (!comparisonResponse.ok) throw new Error(comparisonPayload.detail ?? "The T-100 comparison is unavailable.");
+      setResult(comparisonPayload);
+      if (!trendResponse.ok) {
+        setTrend(null);
+        setTrendError(trendPayload.detail ?? "The monthly T-100 trend is unavailable.");
+      } else {
+        setTrend(trendPayload);
+      }
     } catch (cause) {
       setResult(null);
       setError(cause instanceof Error ? cause.message : "The T-100 comparison is unavailable.");
     } finally {
       setLoading(false);
+      setTrendLoading(false);
     }
   }
 
-  useEffect(() => { void load(); }, []);
+  useEffect(() => { void load(); }, [mode]);
+
+  if (mode === "public") {
+    return (
+      <main className="page public-capacity-page">
+        <header className="public-secondary-hero">
+          <p className="eyebrow">Capacity context</p>
+          <h1 className="title">How full was the system?</h1>
+          <p className="subtitle">T-100 adds passengers, seats, and operated flights to the on-time story. This view keeps the question simple: do fuller route-months look different from less-full ones?</p>
+        </header>
+        {summaryLoading && <div className="public-result-placeholder">Reading the T-100 snapshot…</div>}
+        {summaryError && <div className="inline-data-warning">The capacity snapshot is not available right now. You can still explore the carrier, airport, and route views.</div>}
+        {summary && (
+          <>
+            <section className="public-capacity-result">
+              <div><p className="eyebrow">What the capacity record says</p><h2>{formatPercent(summary.overview.load_factor)} of listed seats were filled.</h2><p>That is the network-wide T-100 average across the loaded route-month history.</p></div>
+              <div className="public-capacity-metrics">
+                <div><span>Route-month records</span><strong>{formatInteger(summary.overview.route_month_rows)}</strong></div>
+                <div><span>Passengers recorded</span><strong>{formatInteger(summary.overview.passengers)}</strong></div>
+                <div><span>Seats listed</span><strong>{formatInteger(summary.overview.seats_available)}</strong></div>
+              </div>
+            </section>
+            <p className="page-note public-boundary-note">This is a descriptive snapshot, not a claim about cause. The researcher workspace adds the matched on-time comparison, filters, chart, and join details.</p>
+          </>
+        )}
+        <section className="public-capacity-next"><div><p className="eyebrow">Want to investigate?</p><h2>Open the evidence workspace.</h2><p>Use the researcher view to change the minimum flight threshold, filter by airline, and inspect the matched rows.</p></div><button type="button" className="primary-action" onClick={() => setMode("researcher")}>Open researcher view <span>→</span></button></section>
+      </main>
+    );
+  }
 
   return (
     <main className="page">
@@ -74,6 +155,12 @@ export default function CapacityPage() {
           We compare the two datasets at the same level: <strong>carrier + route + month</strong>.
           The result is an association to investigate, not a claim that passenger demand causes delay.
         </p>
+      </section>
+
+      <section className="capacity-reading-guide" aria-label="How to read the T-100 comparison">
+        <div><span>01</span><strong>Traffic context</strong><p>T-100 tells us how many seats and passengers were offered on a route each month.</p></div>
+        <div><span>02</span><strong>Operating outcome</strong><p>OTP tells us how often the matched flights arrived on time.</p></div>
+        <div><span>03</span><strong>Relationship</strong><p>The comparison shows whether the two measures move together. It is not proof of cause.</p></div>
       </section>
 
       <section className="section">
@@ -118,6 +205,22 @@ export default function CapacityPage() {
               <span className="decision-verdict-label">Simple read</span>
               <strong>{relationship(result.overview.correlation_load_factor_on_time)}</strong> between the share of seats filled and the route-month on-time rate.
               <span className="capacity-verdict-note">A relationship helps decide what to investigate next; it does not isolate the cause.</span>
+            </div>
+          </section>
+
+          <section className="section">
+            <div className="section-head">
+              <h2 className="section-title">Traffic context over time</h2>
+              <span className="section-note">same matched history</span>
+            </div>
+            <div className="screen capacity-trend-screen">
+              <p className="page-note capacity-trend-intro">
+                Two lines answer the practical question: how full were the matched routes, and how often were their flights on time?
+              </p>
+              {trendLoading && <p className="page-note">Building the monthly view…</p>}
+              {trendError && <p className="page-note">{trendError}</p>}
+              {trend && trend.months.length > 0 && <CapacityTrendChart data={trend.months} />}
+              {trend && trend.months.length === 0 && <p className="page-note">No monthly trend points met the selected threshold.</p>}
             </div>
           </section>
 

@@ -114,9 +114,14 @@ warehouse used for this project currently contains T-100 through May 2026 and
 OTP through June 2026.
 
 The API exposes the resulting provenance through `/api/data-sources`, route-month
-capacity context through `/api/capacity/summary`, and a grain-matched T-100 vs.
-on-time comparison through `/api/capacity/correlation`. The Researcher view
-has both a dedicated T-100 page and a Decision Center tab for that comparison.
+capacity context through `/api/capacity/summary`, a grain-matched T-100 vs.
+on-time comparison through `/api/capacity/correlation`, and a simple monthly
+trend through `/api/capacity/trend`. The Researcher view has both a dedicated
+T-100 page and a Decision Center tab for that comparison. T-100 freshness can
+be checked manually with `python -m pipeline.auto_update_bts`; the process
+records its result in `Data/t100_pipeline_state.json`, reloads only the T-100
+table when a verified BTS ZIP is available, and never fabricates an unpublished
+month.
 Before the enrichment tables are loaded, those endpoints report that state
 explicitly; they do not substitute fabricated values.
 

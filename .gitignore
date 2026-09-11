@@ -30,6 +30,7 @@ venv/
 # Node / Next.js
 node_modules/
 frontend/.next/
+frontend/.next-airlinesapp/
 frontend/out/
 frontend/.vercel/
 npm-debug.log*
