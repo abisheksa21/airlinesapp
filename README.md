@@ -9,6 +9,9 @@ resilience/centrality ranking, and a predictive risk model).
 See [CLAUDE.md](CLAUDE.md) for architecture details, commands, and
 conventions if you're developing on this codebase.
 
+For the complete cross-platform setup, data rebuild, T-100 enrichment, and
+run/troubleshooting procedure, see [RUNNING_GUIDE.md](RUNNING_GUIDE.md).
+
 ## The data is not in this repo
 
 Everything here runs on U.S. DOT/BTS "Marketing Carrier On-Time Performance"
