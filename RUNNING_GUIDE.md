@@ -252,7 +252,27 @@ Open:
 http://127.0.0.1:3100
 ~~~
 
-### Option B — Two terminals on Windows or macOS
+### Option B — macOS one-command start
+
+From the repository root in Terminal, make the launcher executable once and
+run it:
+
+~~~
+chmod +x start_app.sh
+./start_app.sh
+~~~
+
+Open:
+
+~~~
+http://127.0.0.1:3100
+~~~
+
+The script stops stale listeners on ports 8200 and 3100, starts FastAPI in the
+background, starts Next.js in the current terminal, and stops the backend when
+you press Ctrl+C.
+
+### Option C — Two terminals on Windows or macOS
 
 Terminal 1: backend, from the repository root with .venv activated.
 
