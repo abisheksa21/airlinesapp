@@ -7,7 +7,7 @@ import ComparisonChart, { ScenarioTrend } from "../components/ComparisonChart";
 import EntityCompare from "../components/EntityCompare";
 import { formatNumber } from "../lib/format";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8200";
 
 type Scenario = {
   id: string;

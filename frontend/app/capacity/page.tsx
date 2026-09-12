@@ -8,7 +8,7 @@ import type { CapacityCorrelationResult, CapacityTrendResult } from "../decision
 import { useMode } from "../lib/mode";
 import CapacityTrendChart from "../components/CapacityTrendChart";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8200";
 const CARRIER_CODES = Object.keys(CARRIER_NAMES);
 
 type CapacitySummaryResult = {

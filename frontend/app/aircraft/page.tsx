@@ -15,7 +15,7 @@ import DelayPropagationSummary from "../components/DelayPropagationSummary";
 import AircraftRotationTimeline from "../components/AircraftRotationTimeline";
 import { CARRIER_NAMES, carrierName } from "../lib/carriers";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8200";
 
 type Aircraft = { tail: string; total_flights: number; on_time_rate: number };
 type MonthPoint = { month: string; total_flights: number; on_time_rate: number };

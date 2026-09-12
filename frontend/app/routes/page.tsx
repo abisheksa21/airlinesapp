@@ -13,7 +13,7 @@ import DiversionLandingChart from "../components/DiversionLandingChart";
 import { formatNumber } from "../lib/format";
 import { useMode } from "../lib/mode";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8200";
 
 type Route = { route: string; total_flights: number; on_time_rate: number };
 type Cause = { cause: string; minutes: number; share: number };

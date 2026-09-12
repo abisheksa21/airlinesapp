@@ -2,7 +2,7 @@ import Link from "next/link";
 import { carrierName } from "../lib/carriers";
 import AutomatedCheckPanel from "../components/AutomatedCheckPanel";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8200";
 
 type CarrierRow = {
   carrier: string;

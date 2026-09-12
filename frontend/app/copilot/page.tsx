@@ -14,7 +14,7 @@ import DiversionLandingChart from "../components/DiversionLandingChart";
 import SchedulePaddingChart from "../components/SchedulePaddingChart";
 import FlexibleQueryChart from "../components/FlexibleQueryChart";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8200";
 
 type ToolEvidence = { tool: string; result: any };
 

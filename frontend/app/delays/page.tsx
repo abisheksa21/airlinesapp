@@ -7,7 +7,7 @@ import CancellationCauseChart from "../components/CancellationCauseChart";
 import DistanceBucketChart from "../components/DistanceBucketChart";
 import { CARRIER_NAMES, carrierName } from "../lib/carriers";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8200";
 
 type Cause = { cause: string; minutes: number; share: number };
 

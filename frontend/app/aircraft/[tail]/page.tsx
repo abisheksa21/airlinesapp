@@ -11,7 +11,7 @@ import RouteChart from "../../components/RouteChart";
 import { carrierName } from "../../lib/carriers";
 import { useMode } from "../../lib/mode";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8000";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8200";
 
 function buildQuery(params: Record<string, string>): string {
   const usp = new URLSearchParams();
