@@ -13,9 +13,11 @@ from typing import Any
 import duckdb
 
 from config import DUCKDB_FILE
+from pipeline.otp_core import CORE_TABLE_NAME, build_otp_core_table
 
 
 ANALYTICS_TABLES = (
+    CORE_TABLE_NAME,
     "analytics_network_month",
     "analytics_carrier_month",
     "analytics_route_month",
@@ -26,6 +28,7 @@ ANALYTICS_TABLES = (
 
 def build_analytics_tables(connection: Any) -> dict[str, int]:
     """Replace all dashboard aggregate tables and return their row counts."""
+    core_count = build_otp_core_table(connection)
     statements = {
         "analytics_network_month": """
             CREATE OR REPLACE TABLE analytics_network_month AS
@@ -38,7 +41,7 @@ def build_analytics_tables(connection: Any) -> dict[str, int]:
                 AVG(Cancelled * 1.0) AS cancellation_rate,
                 COUNT(DISTINCT Origin || '-' || Dest) AS unique_routes,
                 COUNT(DISTINCT Origin) + COUNT(DISTINCT Dest) AS airport_endpoint_count
-            FROM flights
+            FROM analytics_flight_core
             WHERE FlightDate IS NOT NULL
             GROUP BY year_month
             ORDER BY year_month
@@ -53,7 +56,7 @@ def build_analytics_tables(connection: Any) -> dict[str, int]:
                 AVG(CASE WHEN Cancelled = 0 THEN CASE WHEN ArrDel15 = 0 THEN 1.0 ELSE 0.0 END END) AS on_time_rate,
                 AVG(CASE WHEN Cancelled = 0 THEN ArrDelay END) AS avg_arrival_delay_minutes,
                 AVG(Cancelled * 1.0) AS cancellation_rate
-            FROM flights
+            FROM analytics_flight_core
             WHERE FlightDate IS NOT NULL AND Marketing_Airline_Network IS NOT NULL
             GROUP BY Marketing_Airline_Network, year_month
             ORDER BY carrier, year_month
@@ -70,7 +73,7 @@ def build_analytics_tables(connection: Any) -> dict[str, int]:
                 AVG(CASE WHEN Cancelled = 0 THEN ArrDelay END) AS avg_arrival_delay_minutes,
                 AVG(Cancelled * 1.0) AS cancellation_rate,
                 MAX(Distance) AS distance_miles
-            FROM flights
+            FROM analytics_flight_core
             WHERE FlightDate IS NOT NULL AND Origin IS NOT NULL AND Dest IS NOT NULL
             GROUP BY Origin, Dest, year_month
             ORDER BY origin, dest, year_month
@@ -83,7 +86,7 @@ def build_analytics_tables(connection: Any) -> dict[str, int]:
                     strftime(FlightDate, '%Y-%m') AS year_month,
                     'outbound' AS direction,
                     Dest AS related_airport
-                FROM flights
+                FROM analytics_flight_core
                 WHERE FlightDate IS NOT NULL AND Origin IS NOT NULL
                 UNION ALL
                 SELECT
@@ -91,7 +94,7 @@ def build_analytics_tables(connection: Any) -> dict[str, int]:
                     strftime(FlightDate, '%Y-%m') AS year_month,
                     'inbound' AS direction,
                     Origin AS related_airport
-                FROM flights
+                FROM analytics_flight_core
                 WHERE FlightDate IS NOT NULL AND Dest IS NOT NULL
             )
             SELECT
@@ -121,15 +124,17 @@ def build_analytics_tables(connection: Any) -> dict[str, int]:
                 quantile_cont(ArrDelay, 0.50) FILTER (WHERE Cancelled = 0 AND ArrDelay IS NOT NULL) AS median_arrival_delay_minutes,
                 quantile_cont(ArrDelay, 0.90) FILTER (WHERE Cancelled = 0 AND ArrDelay IS NOT NULL) AS p90_arrival_delay_minutes,
                 AVG(Cancelled * 1.0) AS cancellation_rate
-            FROM flights
+            FROM analytics_flight_core
             WHERE Origin IS NOT NULL AND Dest IS NOT NULL AND CRSDepTime IS NOT NULL
             GROUP BY Origin, Dest, Marketing_Airline_Network, departure_hour
             ORDER BY origin, dest, carrier, departure_hour
         """,
     }
 
-    counts: dict[str, int] = {}
+    counts: dict[str, int] = {CORE_TABLE_NAME: core_count}
     for table_name in ANALYTICS_TABLES:
+        if table_name == CORE_TABLE_NAME:
+            continue
         connection.execute(statements[table_name])
         counts[table_name] = int(connection.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])
     return counts

@@ -78,11 +78,14 @@ app.
 ### Step 4 — Materialize the dashboard analytics layer
 
 The raw `flights` table is always the source of truth. After a full build, the
-pipeline creates five compact, deterministic tables for the pages that are
-visited most often: network-month, carrier-month, route-month, airport-month,
-and route + carrier + departure-hour. They contain derived counts and rates,
-not fabricated observations. They are rebuilt automatically by
-`pipeline.build_warehouse` and refreshed by `pipeline.auto_update`.
+pipeline creates one explicit compact flight projection and five compact,
+deterministic aggregate tables for the pages that are visited most often:
+network-month, carrier-month, route-month, airport-month, and route + carrier +
+departure-hour. The projection keeps only fields needed by the dashboard and
+future forecasting work; the aggregates contain derived counts and rates, not
+fabricated observations. All six are rebuilt automatically by
+`pipeline.build_warehouse` and refreshed by `pipeline.auto_update`. See
+[`OTP_CORE_SCHEMA.md`](OTP_CORE_SCHEMA.md) for the field contract.
 
 To refresh them manually after importing an existing warehouse:
 
