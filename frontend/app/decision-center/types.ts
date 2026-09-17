@@ -61,6 +61,8 @@ export type Metrics = {
   calibration_bins: CalibrationBin[];
 };
 
+export type RiskMethod = "math" | "ml" | "comparison";
+
 export type Coefficient = {
   feature: string;
   standardized_coefficient: number;
@@ -150,9 +152,13 @@ export type RiskResult = {
   as_of_period: string;
   risk_probability: number;
   risk_band: string;
+  math_baseline_probability: number;
+  math_baseline_band: string;
+  math_baseline_definition: string;
   risk_threshold_definition: string;
   current_features: Record<string, number>;
   model_coefficients: Coefficient[];
+  calibration_status: string;
   split: {
     train_end: string;
     validation_end: string;
@@ -162,5 +168,11 @@ export type RiskResult = {
   };
   validation_metrics: Metrics;
   test_metrics: Metrics;
+  baseline_validation_metrics: Metrics;
+  baseline_test_metrics: Metrics;
+  model_selection: {
+    ml_better_on: string[];
+    note: string;
+  };
   entities_in_training_panel: number;
 };

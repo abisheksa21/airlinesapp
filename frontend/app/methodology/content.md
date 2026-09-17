@@ -321,6 +321,22 @@ predicted-versus-observed calibration bins.
 If PR-AUC is close to the test-set positive rate, the model found little useful
 signal. A high or low label is therefore a screening signal, not a certainty.
 
+The researcher view also shows a transparent math baseline beside the ML model.
+It estimates the next risk probability from the entity's own earlier labelled
+months using Laplace smoothing:
+
+```text
+math baseline = (earlier risky months + 1) / (earlier labelled months + 2)
+```
+
+When an entity has no earlier labelled months, the baseline uses the training
+panel's overall risky-month rate. The Comparison tab evaluates this baseline and
+the ML model on the same later test months. Lower Brier score and log loss mean
+the probability was closer to what happened; higher PR-AUC means better ranking
+of difficult months. This makes the choice between a simple rule and ML an
+empirical question rather than an assumption that a more complex model is
+automatically better.
+
 ## Departure Bank Smoothing
 
 This is the most detailed optimizer in the Decision Center. A departure bank
@@ -465,6 +481,145 @@ every flight row. That would multiply the aggregate and create false exposure.
 The source and availability status remain available through
 `/api/data-sources`; the matched comparison is served by
 `/api/capacity/correlation`.
+
+## Route delay forecast baseline
+
+The route lookup includes a first, deliberately interpretable forecast. It is
+not trying to predict the exact delay of one future flight. It answers a more
+modest question: **when we look at comparable earlier flights, what outcome is
+the most reasonable starting expectation for this route?**
+
+The user can choose an origin, destination, airline, departure hour, and target
+month. For a target month, the model applies a strict cutoff:
+
+```text
+training flights = flights with FlightDate before the first day of target month
+```
+
+This prevents the target month from quietly becoming part of its own forecast.
+If no target month is supplied, the target defaults to the month after the
+latest dated observation in the warehouse.
+
+The comparison starts at the most specific level requested:
+
+1. route + airline + departure hour
+2. route + airline, or route + departure hour when only one filter was given
+3. route
+
+The model widens the level only when the more specific slice has fewer than 30
+completed flights. The response reports the level actually used, the training
+cutoff, the sample size, and the date range so a result is not presented with
+false precision.
+
+The visible outputs are simple summaries of the matched history:
+
+```text
+expected delay       = average ArrDelay over completed flights
+late-arrival chance  = flights with ArrDel15 = 1 ÷ completed flights
+cancellation chance  = cancelled flights ÷ scheduled flights
+```
+
+For uncertainty, the API also returns a 95% Wilson interval for the late and
+cancellation rates. This is useful when comparing a large route history with a
+small one: a percentage based on 30 flights should be read more cautiously than
+the same percentage based on 3,000 flights.
+
+The baseline is checked with an expanding time split. It predicts each later
+month using only the months before it, records the error, and then adds that
+month to the historical pool. The displayed delay error is mean absolute error:
+
+```text
+MAE = average of |predicted monthly delay − actual monthly delay|
+```
+
+When the T-100 Segment route-month table is available, the forecast adds one
+small traffic feature without copying a monthly value onto individual flights.
+It looks at the latest T-100 route-month before the target, calculates its load
+factor, and labels it **lower load** (<70%), **typical load** (70–85%), or
+**higher load** (85%+). It then finds earlier OTP months with the same band and
+uses their weighted late rate and average delay. At least three earlier
+traffic-matched months and 30 completed OTP flights are required; otherwise the
+plain historical baseline remains the answer.
+
+The researcher view reports both checks so we can ask the useful question:
+
+```text
+Did the T-100 traffic-band estimate reduce held-out error
+relative to the plain historical baseline?
+```
+
+This is still a benchmark, not a weather or live-operations forecast. It does
+not include aircraft rotations, airport congestion, or causal intervention
+effects. A change from the historical baseline is an association to investigate,
+not proof that fuller flights caused more delay.
+
+## First route ML candidate
+
+The researcher API also exposes `/api/route-ml-forecast`. This is deliberately
+separate from the public route answer while it is being evaluated. It uses a
+regularized ridge regression at the selected route-scenario + month grain to
+produce three estimates:
+
+```text
+expected arrival-delay minutes
+late-arrival rate
+cancellation rate
+```
+
+The features are all available before the target month: the route's expanding
+and recent historical rates, recent average delay, lagged T-100 load factor,
+lagged passengers and seats, lagged T-100 completion rate, calendar seasonality,
+and the amount of prior completed history. The feature builder enforces the
+period boundary itself, so a future row cannot alter an earlier feature vector.
+
+The model uses a chronological 60% / 20% / 20% train, validation, and test
+split. It is refit on all pre-target examples only after the held-out check is
+recorded. The response returns model coefficients, target features, validation
+metrics, test metrics, and the equivalent historical-baseline test metrics.
+That comparison is essential: if the ML candidate loses to the transparent
+baseline, it remains a research result and is not promoted to the public view.
+
+This first version is intentionally modest. It is a route-specific monthly
+candidate, not a flight-level operational prediction. A later panel model or
+tree-based model should be added only if it improves time-based test results
+across several routes, not just one example. T-100 remains a predictive context
+feature and an association to investigate, not evidence that passenger demand
+causes delay.
+
+## Shared route-panel candidate
+
+The researcher Routes page can also run `/api/route-panel-forecast`. This model
+learns from many route-month histories in the materialized `analytics_route_month`
+table and then scores the selected route. Its panel features are prior route
+late rate, prior delay, prior cancellation rate, recent movement, lagged T-100
+load factor/passenger/seat context, distance, and calendar seasonality. T-100
+is joined as-of each OTP month, so the model only sees the latest traffic
+record that was available before that month. It currently does not use the
+selected airline or departure hour; the interface says so explicitly instead
+of implying a more specific forecast than the data supports.
+
+The panel is split by calendar period into training, validation, and test
+examples. Its held-out MAE is compared with the same expanding historical
+baseline. This gives us a fair progression: first test whether shared network
+history and lagged T-100 context help, then compare a tree-based model only if
+the simpler candidate justifies the extra complexity.
+
+### T-100 ablation: testing whether the extra source earns its place
+
+The panel model now runs one additional held-out experiment. It fits the same
+ridge model twice on the same chronological train/test split:
+
+```text
+with T-100    = OTP history + lagged seats/passengers/load/completion + distance + season
+OTP-only      = OTP history + distance + season
+```
+
+The T-100 version is useful only when it lowers the later-month error for an
+outcome. This is an ablation, not a causal experiment: it tells us whether the
+traffic variables add predictive information in this dataset and time window;
+it does not prove that fuller flights cause delays. The Routes Comparison tab
+shows this result beside the ordinary Math-versus-ML comparison so the extra
+dataset remains auditable.
 
 ## Supporting queue-pressure model
 

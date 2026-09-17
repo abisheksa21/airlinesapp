@@ -47,7 +47,7 @@ from typing import Any
 
 import numpy as np
 
-from api.db import open_readonly_connection
+from api.db import best_flight_table, open_readonly_connection
 from api.metrics import COMPLETED_FLIGHT_SQL, SEVERE_DELAY_SQL
 
 # Training the panel model (query + build examples + fit logistic regression
@@ -77,6 +77,7 @@ FEATURE_NAMES = (
 )
 
 TREND_LOOKBACK_MONTHS = 3
+BASELINE_SMOOTHING = 1.0
 
 
 def _sigmoid(values: np.ndarray) -> np.ndarray:
@@ -200,6 +201,55 @@ def evaluate_probabilities(labels: np.ndarray, probabilities: np.ndarray) -> dic
         "precision_recall_auc": round(_pr_auc(labels, clipped), 6),
         "calibration_bins": bins,
     }
+
+
+def historical_risk_baseline_probabilities(
+    rows: list[dict[str, Any]],
+    *,
+    known_history: list[dict[str, Any]],
+    fallback_probability: float,
+) -> np.ndarray:
+    """Return an expanding, entity-specific probability baseline.
+
+    For each scored example, the baseline is the smoothed share of that
+    entity's earlier labelled months that were risky. If an entity has no
+    earlier labelled months, it falls back to the training-panel risk rate.
+    The scored rows are then added one at a time, so a later row can learn
+    from an earlier observed outcome without seeing its own label in advance.
+    """
+    prior_labels: dict[str, list[int]] = {}
+    for row in sorted(known_history, key=lambda item: (str(item["target_period"]), str(item["entity"]))):
+        prior_labels.setdefault(str(row["entity"]), []).append(int(row["label"]))
+
+    predictions = np.zeros(len(rows), dtype=float)
+    ordered = sorted(enumerate(rows), key=lambda item: (str(item[1]["target_period"]), str(item[1]["entity"])))
+    fallback = min(max(float(fallback_probability), 0.0), 1.0)
+    for index, row in ordered:
+        labels = prior_labels.get(str(row["entity"]), [])
+        if labels:
+            predictions[index] = (sum(labels) + BASELINE_SMOOTHING) / (
+                len(labels) + 2.0 * BASELINE_SMOOTHING
+            )
+        else:
+            predictions[index] = fallback
+        prior_labels.setdefault(str(row["entity"]), []).append(int(row["label"]))
+    return predictions
+
+
+def historical_risk_baseline_probability(
+    *,
+    entity: str,
+    known_history: list[dict[str, Any]],
+    fallback_probability: float,
+) -> float:
+    """Score the next period with the same expanding baseline used in tests."""
+    entity_rows = [row for row in known_history if str(row["entity"]).upper() == entity.upper()]
+    if not entity_rows:
+        return min(max(float(fallback_probability), 0.0), 1.0)
+    labels = [int(row["label"]) for row in entity_rows]
+    return (sum(labels) + BASELINE_SMOOTHING) / (
+        len(labels) + 2.0 * BASELINE_SMOOTHING
+    )
 
 
 def _trend_and_seasonal(series: list[dict[str, Any]], index: int, lookback_months: int = TREND_LOOKBACK_MONTHS) -> tuple[float, float]:
@@ -377,6 +427,17 @@ def train_temporal_risk_model(
 
     y_val, p_val = score(validation)
     y_test, p_test = score(test)
+    fallback_probability = float(y_train.mean())
+    baseline_validation = historical_risk_baseline_probabilities(
+        validation,
+        known_history=train,
+        fallback_probability=fallback_probability,
+    )
+    baseline_test = historical_risk_baseline_probabilities(
+        test,
+        known_history=[*train, *validation],
+        fallback_probability=fallback_probability,
+    )
 
     coefficient_records = [
         {"feature": name, "standardized_coefficient": round(float(value), 6),
@@ -402,6 +463,9 @@ def train_temporal_risk_model(
         },
         "validation_metrics": validation_metrics,
         "test_metrics": evaluate_probabilities(y_test, p_test),
+        "baseline_validation_metrics": evaluate_probabilities(y_val, baseline_validation),
+        "baseline_test_metrics": evaluate_probabilities(y_test, baseline_test),
+        "baseline_fallback_probability": round(fallback_probability, 6),
         "coefficients": coefficient_records,
     }
 
@@ -416,31 +480,38 @@ def _query_monthly_entity_rows(
     else:
         raise ValueError("entity_type must be 'airport' or 'carrier'")
 
-    query = f"""
-        SELECT
-            {entity_sql} AS entity,
-            strftime(FlightDate, '%Y-%m') AS period,
-            COUNT(*) AS flight_volume,
-            AVG(CASE WHEN {SEVERE_DELAY_SQL} THEN 1.0 WHEN {COMPLETED_FLIGHT_SQL} THEN 0.0 END) AS severe_delay_rate,
-            AVG(CASE WHEN Cancelled = 1 THEN 1.0 ELSE 0.0 END) AS cancellation_rate,
-            AVG(CASE WHEN {COMPLETED_FLIGHT_SQL} THEN DepDelay END) AS average_departure_delay,
-            SUM(CASE WHEN {COMPLETED_FLIGHT_SQL} THEN COALESCE(LateAircraftDelay, 0) ELSE 0 END)
-                / NULLIF(SUM(CASE WHEN {COMPLETED_FLIGHT_SQL} THEN GREATEST(COALESCE(ArrDelay, 0), 0) ELSE 0 END), 0) AS late_aircraft_delay_share,
-            -- Despite the name, this is taxi time as a fraction of flight
-            -- duration, not excess/congestion-caused delay -- see the
-            -- caveat where this column feeds build_supervised_examples.
-                AVG(
-                    CASE WHEN {COMPLETED_FLIGHT_SQL} AND TaxiOut IS NOT NULL AND TaxiIn IS NOT NULL AND ActualElapsedTime > 0
-                     THEN (TaxiOut + TaxiIn) * 1.0 / ActualElapsedTime END
-            ) AS ground_delay_share
-        FROM flights
-        WHERE FlightDate BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
-            AND {entity_sql} IS NOT NULL
-        GROUP BY entity, period
-        HAVING COUNT(*) >= ?
-        ORDER BY entity, period
-    """
     with open_readonly_connection() as connection:
+        source_table = best_flight_table(
+            connection,
+            {
+                "FlightDate", entity_sql, "Cancelled", "Diverted", "ArrDelay", "ArrDel15",
+                "DepDelay", "LateAircraftDelay", "TaxiOut", "TaxiIn", "ActualElapsedTime",
+            },
+        )
+        query = f"""
+            SELECT
+                {entity_sql} AS entity,
+                strftime(FlightDate, '%Y-%m') AS period,
+                COUNT(*) AS flight_volume,
+                AVG(CASE WHEN {SEVERE_DELAY_SQL} THEN 1.0 WHEN {COMPLETED_FLIGHT_SQL} THEN 0.0 END) AS severe_delay_rate,
+                AVG(CASE WHEN Cancelled = 1 THEN 1.0 ELSE 0.0 END) AS cancellation_rate,
+                AVG(CASE WHEN {COMPLETED_FLIGHT_SQL} THEN DepDelay END) AS average_departure_delay,
+                SUM(CASE WHEN {COMPLETED_FLIGHT_SQL} THEN COALESCE(LateAircraftDelay, 0) ELSE 0 END)
+                    / NULLIF(SUM(CASE WHEN {COMPLETED_FLIGHT_SQL} THEN GREATEST(COALESCE(ArrDelay, 0), 0) ELSE 0 END), 0) AS late_aircraft_delay_share,
+                -- Despite the name, this is taxi time as a fraction of flight
+                -- duration, not excess/congestion-caused delay -- see the
+                -- caveat where this column feeds build_supervised_examples.
+                    AVG(
+                        CASE WHEN {COMPLETED_FLIGHT_SQL} AND TaxiOut IS NOT NULL AND TaxiIn IS NOT NULL AND ActualElapsedTime > 0
+                         THEN (TaxiOut + TaxiIn) * 1.0 / ActualElapsedTime END
+                ) AS ground_delay_share
+            FROM {source_table}
+            WHERE FlightDate BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
+                AND {entity_sql} IS NOT NULL
+            GROUP BY entity, period
+            HAVING COUNT(*) >= ?
+            ORDER BY entity, period
+        """
         rows = connection.execute(query, [start_date, end_date, minimum_flights]).fetchall()
 
     keys = ["entity", "period", "flight_volume", "severe_delay_rate", "cancellation_rate",
@@ -493,7 +564,7 @@ def _train_panel(
             _PANEL_CACHE[key] = (now, result)
         return result
 
-    result = {"rows": rows, "fit": fit, "risk_threshold": risk_threshold}
+    result = {"rows": rows, "examples": examples, "fit": fit, "risk_threshold": risk_threshold}
     with _PANEL_CACHE_LOCK:
         _PANEL_CACHE[key] = (now, result)
     return result
@@ -547,6 +618,15 @@ def get_predictive_operational_risk(
     calibrator: LogisticModel = fit["calibrator"]
     raw_score = model.decision_function(standardizer.transform(features))
     probability = float(calibrator.predict_proba(raw_score.reshape(-1, 1))[0])
+    known_entity_history = [
+        row for row in panel.get("examples", [])
+        if str(row["entity"]).upper() == entity and str(row["target_period"]) <= str(latest["period"])
+    ]
+    baseline_probability = historical_risk_baseline_probability(
+        entity=entity,
+        known_history=known_entity_history,
+        fallback_probability=float(fit["baseline_fallback_probability"]),
+    )
 
     # These cutoffs are calibrated for risk_quantile=0.75, the only value
     # this endpoint currently uses (risk_quantile isn't exposed as a query
@@ -561,6 +641,12 @@ def get_predictive_operational_risk(
         "as_of_period": latest["period"],
         "risk_probability": round(probability, 4),
         "risk_band": band,
+        "math_baseline_probability": round(baseline_probability, 4),
+        "math_baseline_band": "high" if baseline_probability >= 0.6 else "elevated" if baseline_probability >= 0.4 else "watch" if baseline_probability >= 0.25 else "low",
+        "math_baseline_definition": (
+            "Laplace-smoothed share of this entity's earlier labelled months that were in the network's risky quartile; "
+            "if there is no earlier label, the training-panel risk rate is used."
+        ),
         "risk_threshold_definition": (
             f"Trained to predict whether next month's severe-delay rate (ArrDelay >= 60 min, "
             f"not cancelled/diverted) would land in the network's top {(1 - risk_quantile) * 100:.0f}% "
@@ -581,5 +667,14 @@ def get_predictive_operational_risk(
         "split": fit["split"],
         "validation_metrics": fit["validation_metrics"],
         "test_metrics": fit["test_metrics"],
+        "baseline_validation_metrics": fit["baseline_validation_metrics"],
+        "baseline_test_metrics": fit["baseline_test_metrics"],
+        "model_selection": {
+            "ml_better_on": [
+                metric for metric in ("brier_score", "log_loss")
+                if fit["test_metrics"][metric] < fit["baseline_test_metrics"][metric]
+            ],
+            "note": "The ML probability remains a researcher estimate unless it improves held-out probability quality against the transparent historical baseline.",
+        },
         "entities_in_training_panel": len({row["entity"] for row in rows}),
     }

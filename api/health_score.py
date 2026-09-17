@@ -47,7 +47,7 @@ from typing import Any
 
 from scipy import stats as scipy_stats
 
-from api.db import open_readonly_connection
+from api.db import best_flight_table, open_readonly_connection
 from api.metrics import COMPLETED_FLIGHT_SQL, ON_TIME_FLAG_SQL, SEVERE_DELAY_SQL
 
 MINIMUM_FLIGHTS_FOR_FULL_CONFIDENCE = 30
@@ -211,8 +211,12 @@ def compute_health_score(where_clause: str, params: list[Any]) -> dict | None:
     airports), prefer one GROUP BY query with RAW_STAT_SELECT_EXPRS plus
     score_from_row per result row -- this function runs its own full
     query and is meant for the single-entity case."""
-    query = f"SELECT {RAW_STAT_SELECT_EXPRS} FROM flights WHERE {where_clause}"
     with open_readonly_connection() as connection:
+        source_table = best_flight_table(
+            connection,
+            {"Cancelled", "Diverted", "ArrDelay", "ArrDel15"},
+        )
+        query = f"SELECT {RAW_STAT_SELECT_EXPRS} FROM {source_table} WHERE {where_clause}"
         row = connection.execute(query, params).fetchone()
     return score_from_row(row)
 

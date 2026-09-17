@@ -11,6 +11,7 @@ import type {
   NetworkResilienceResult,
   RankingEntry,
   RankingResult,
+  RiskMethod,
   RiskResult,
   ScenarioCell,
   ScenarioResult,
@@ -42,6 +43,20 @@ function delayColor(minutes: number): string {
   if (minutes <= 15) return "#4f9d8f";
   if (minutes <= 45) return "#e8a33d";
   return "#c9563a";
+}
+
+function loadingMessage(tab: DecisionTab): string {
+  const messages: Record<DecisionTab, string> = {
+    levers: "Reading the carrier's measured history and comparing its score components…",
+    scenario: "Comparing real same-day flight pairs to trace delay propagation…",
+    ranking: "Ranking the network by improvement opportunity and flight reach…",
+    risk: "Training and checking the next-month risk screen on held-out history…",
+    bank: "Testing bounded schedule shifts against historical departure patterns…",
+    portfolio: "Finding the best focus shortlist within your attention budget…",
+    resilience: "Building the airport connection view from observed routes…",
+    capacity: "Matching T-100 traffic with on-time route-months…",
+  };
+  return messages[tab];
 }
 
 // Genuinely derives a verdict from the actual cell values -- doesn't force
@@ -111,6 +126,7 @@ export default function DecisionCenterPage() {
   const [riskEntity, setRiskEntity] = useState("");
   const [airportOptions, setAirportOptions] = useState<string[]>([]);
   const [riskResult, setRiskResult] = useState<RiskResult | null>(null);
+  const [riskMethod, setRiskMethod] = useState<RiskMethod>("math");
 
   const [bankAirport, setBankAirport] = useState("");
   const [bankCarrier, setBankCarrier] = useState("");
@@ -147,6 +163,7 @@ export default function DecisionCenterPage() {
     setScenarioResult(null);
     setRankingResult(null);
     setRiskResult(null);
+    setRiskMethod("math");
     setBankResult(null);
     setPortfolioResult(null);
     setResilienceResult(null);
@@ -278,6 +295,18 @@ export default function DecisionCenterPage() {
           <span><b>Look back</b> what happened</span>
           <span><b>Look ahead</b> what may happen</span>
           <span><b>Try a change</b> what could improve</span>
+        </div>
+      </section>
+
+      <section className="decision-intelligence-map" aria-label="What kind of intelligence each tool provides">
+        <div>
+          <span className="decision-intelligence-kicker">How to interpret the workspace</span>
+          <strong>Each tool answers a different kind of question.</strong>
+        </div>
+        <div className="decision-intelligence-items">
+          <div><span>DESCRIBE</span><p>What happened in the recorded BTS history?</p></div>
+          <div><span>PREDICT</span><p>What pattern may appear next?</p></div>
+          <div><span>OPTIMIZE</span><p>What bounded change is worth testing?</p></div>
         </div>
       </section>
 
@@ -698,6 +727,12 @@ export default function DecisionCenterPage() {
             </div>
           )}
 
+          {loading && (
+            <p className="decision-loading-status" role="status" aria-live="polite">
+              <span className="loading-pulse" /> {loadingMessage(tab)}
+            </p>
+          )}
+
           <p className="decision-tab-type">
             <span>{TAB_HELP[tab].kind}</span> {TAB_HELP[tab].result}
           </p>
@@ -962,95 +997,16 @@ export default function DecisionCenterPage() {
       )}
 
       {tab === "risk" && riskResult && (
-        <>
-          <section className="section">
-            <div className="screen">
-              {(() => {
-                const bandColor: Record<string, string> = {
-                  high: "#c9563a", elevated: "#e8a33d", watch: "#e8a33d", low: "#4f9d8f",
-                };
-                const color = bandColor[riskResult.risk_band] ?? "#9099a8";
-                return (
-                  <div style={{ display: "flex", alignItems: "center", gap: "1.5rem" }}>
-                    <span style={{ fontFamily: "var(--font-mono), monospace", fontSize: "2.4rem", fontWeight: 700, color }}>
-                      {(riskResult.risk_probability * 100).toFixed(0)}%
-                    </span>
-                    <div>
-                      <div style={{ color, fontWeight: 600, textTransform: "capitalize" }}>{riskResult.risk_band} risk</div>
-                      <div className="tile-label">
-                        {riskEntityType === "carrier" ? carrierName(riskResult.entity) : riskResult.entity}
-                        , as of {riskResult.as_of_period}
-                      </div>
-                    </div>
-                  </div>
-                );
-              })()}
-
-              <p className="page-note" style={{ marginTop: "1rem" }}>{riskResult.risk_threshold_definition}</p>
-
-              <div className="decision-verdict" style={{ marginTop: "1rem" }}>
-                <span className="decision-verdict-label">What&apos;s driving this</span>
-                {[...riskResult.model_coefficients]
-                  .sort((a, b) => Math.abs(b.standardized_coefficient) - Math.abs(a.standardized_coefficient))
-                  .slice(0, 3)
-                  .map((c, i) => (
-                    <span key={c.feature}>
-                      {i > 0 && "; "}
-                      <strong>{FEATURE_LABELS[c.feature] ?? c.feature}</strong> ({riskResult.current_features[c.feature]?.toFixed(c.feature === "average_departure_delay" ? 1 : 3)})
-                      {" "}pushes risk {c.direction === "higher_risk" ? "up" : "down"}
-                    </span>
-                  ))}
-                {" "}&mdash; the three features this model weighted most heavily, in order.
-              </div>
-            </div>
-          </section>
-
-          <section className="section">
-            <div className="section-head">
-              <h2 className="section-title">How much should I trust this estimate?</h2>
-            </div>
-            <div className="screen">
-              <div className="board board-compact">
-                <Tile label="Airlines/airports used" value={`${riskResult.entities_in_training_panel}`} />
-                <Tile label="Past examples checked" value={`${riskResult.split.test_examples}`} />
-                <Tile label="Test signal (higher is better)" value={riskResult.test_metrics.precision_recall_auc.toFixed(3)} tone={riskResult.test_metrics.precision_recall_auc < 0.55 ? "rust" : undefined} />
-                <Tile label="Bad-month rate in test" value={`${(riskResult.test_metrics.positive_rate * 100).toFixed(1)}%`} />
-              </div>
-              <p className="page-note" style={{ marginTop: "0.75rem" }}>
-                The model is checked on later examples it did not see while learning. A higher test
-                signal means it separates difficult months better than a random guess. Learning used
-                data through {riskResult.split.train_end}; the final check used only later periods.
-              </p>
-
-              {riskResult.test_metrics.calibration_bins.length > 0 && (
-                <div style={{ marginTop: "1.25rem" }}>
-                  <p className="eyebrow" style={{ marginBottom: "0.75rem" }}>
-                    Predicted risk compared with what actually happened
-                  </p>
-                  <table className="compare-table">
-                    <thead>
-                      <tr><th>Predicted group</th><th>Count</th><th>Average estimate</th><th>Actually observed</th></tr>
-                    </thead>
-                    <tbody>
-                      {riskResult.test_metrics.calibration_bins.map((b) => (
-                        <tr key={b.probability_band}>
-                          <td>{b.probability_band}</td>
-                          <td>{b.count}</td>
-                          <td>{(b.mean_predicted_probability * 100).toFixed(1)}%</td>
-                          <td>{(b.observed_risk_rate * 100).toFixed(1)}%</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                  <p className="page-note" style={{ marginTop: "0.5rem" }}>
-                    If the estimate and the observed result are close, the risk label is behaving
-                    sensibly. If they are far apart, treat the label as a rough warning.
-                  </p>
-                </div>
-              )}
-            </div>
-          </section>
-        </>
+        <section className="section">
+          <div className="screen">
+            <PredictiveRiskExplorer
+              riskResult={riskResult}
+              riskEntityType={riskEntityType}
+              riskMethod={riskMethod}
+              onMethodChange={setRiskMethod}
+            />
+          </div>
+        </section>
       )}
 
       {tab === "bank" && bankResult && (
@@ -1068,7 +1024,7 @@ export default function DecisionCenterPage() {
               <span className="decision-verdict-label">What the optimizer suggests</span>
               {bankResult.original_peak_load > bankResult.optimized_peak_load ? (
                 <>Under the selected constraints, shifting <strong>{bankResult.flights_moved} flights</strong>
-                could reduce the busiest 15-minute period by <strong>{bankResult.original_peak_load - bankResult.optimized_peak_load} flights</strong>.
+                {" "}could reduce the busiest 15-minute period by <strong>{bankResult.original_peak_load - bankResult.optimized_peak_load} flights</strong>.
                 This is a schedule experiment to investigate, not a guarantee of certified capacity.</>
               ) : (
                 <>The selected shift limits do not reduce the busiest bucket in this window. That is a useful
@@ -1146,8 +1102,9 @@ export default function DecisionCenterPage() {
               <Tile label="Main goal" value={METRIC_LABELS[portfolioResult.primary_metric] ?? portfolioResult.primary_metric} />
               <Tile label="Attention rule" value={COST_MODEL_LABELS[portfolioResult.cost_model] ?? portfolioResult.cost_model} />
             </div>
-            <p className="page-note" style={{ marginTop: "0.75rem" }}>
+              <p className="page-note" style={{ marginTop: "0.75rem" }}>
               The tool picks the combination with the most {METRIC_LABELS[portfolioResult.primary_metric] ?? "of the selected measure"}
+              {" "}
               while staying within the number of targets you allowed.
             </p>
 
@@ -1155,7 +1112,7 @@ export default function DecisionCenterPage() {
               <span className="decision-verdict-label">What this gives you</span>
               {portfolioResult.selected.length > 0 ? (
                 <>A short list of <strong>{portfolioResult.selected.length} target{portfolioResult.selected.length === 1 ? "" : "s"}</strong>
-                that best fit the selected budget and objective. Use it to decide where to look first;
+                {" "}that best fit the selected budget and objective. Use it to decide where to look first;
                 the historical metrics do not predict the size of an intervention&apos;s effect.</>
               ) : (
                 <>No candidate fits the current budget and constraints. Increase the budget or change the
@@ -1227,7 +1184,7 @@ export default function DecisionCenterPage() {
             {resilienceResult.betweenness_centrality.top_structural_bridges[0] && (
               <div className="decision-verdict" style={{ marginTop: "1rem" }}>
                 <span className="decision-verdict-label">What this reveals</span>
-                <strong>{resilienceResult.betweenness_centrality.top_structural_bridges[0].airport}</strong> is the
+                <strong>{resilienceResult.betweenness_centrality.top_structural_bridges[0].airport}</strong>{" "}is the
                 top connector in this view. This is different from busiest: it highlights an airport that links
                 otherwise separate parts of the network.
               </div>
@@ -1336,6 +1293,294 @@ export default function DecisionCenterPage() {
         </section>
       )}
     </main>
+  );
+}
+
+const RISK_BAND_COLORS: Record<string, string> = {
+  high: "#c9563a",
+  elevated: "#e8a33d",
+  watch: "#e8a33d",
+  low: "#4f9d8f",
+};
+
+function riskBandColor(band: string): string {
+  return RISK_BAND_COLORS[band] ?? "#9099a8";
+}
+
+function riskBandLabel(band: string): string {
+  return `${band.slice(0, 1).toUpperCase()}${band.slice(1)} risk`;
+}
+
+function riskMetricWinner(metric: "brier_score" | "log_loss" | "precision_recall_auc", math: number, ml: number): string {
+  if (math === ml) return "Tie";
+  if (metric === "precision_recall_auc") return ml > math ? "ML" : "Math";
+  return ml < math ? "ML" : "Math";
+}
+
+function PredictiveRiskExplorer({
+  riskResult,
+  riskEntityType,
+  riskMethod,
+  onMethodChange,
+}: {
+  riskResult: RiskResult;
+  riskEntityType: "carrier" | "airport";
+  riskMethod: RiskMethod;
+  onMethodChange: (method: RiskMethod) => void;
+}) {
+  const entityLabel = riskEntityType === "carrier" ? carrierName(riskResult.entity) : riskResult.entity;
+  const tabs: Array<{ id: RiskMethod; title: string; detail: string }> = [
+    { id: "math", title: "Math baseline", detail: "A clear historical starting point" },
+    { id: "ml", title: "ML model", detail: "A learned pattern from eight signals" },
+    { id: "comparison", title: "Comparison", detail: "Which one works better later?" },
+  ];
+
+  return (
+    <div className="forecast-explorer risk-method-explorer">
+      <div className="forecast-explorer-heading">
+        <div>
+          <span className="method-kicker">Three ways to read this estimate</span>
+          <h2 className="section-title">Will the next month be unusually difficult?</h2>
+          <p className="page-note">
+            Start with the simple historical answer, inspect what the ML model adds, then compare both on months held back from training.
+          </p>
+        </div>
+        <span className="method-status">real data · researcher view</span>
+      </div>
+
+      <div className="forecast-method-tabs" role="tablist" aria-label="Predictive risk methods">
+        {tabs.map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            role="tab"
+            aria-selected={riskMethod === item.id}
+            className={`forecast-method-tab${riskMethod === item.id ? " active" : ""}`}
+            onClick={() => onMethodChange(item.id)}
+          >
+            <span>{item.title}</span>
+            <small>{item.detail}</small>
+          </button>
+        ))}
+      </div>
+
+      {riskMethod === "math" && <RiskMathPanel riskResult={riskResult} entityLabel={entityLabel} />}
+      {riskMethod === "ml" && <RiskMLPanel riskResult={riskResult} entityLabel={entityLabel} />}
+      {riskMethod === "comparison" && <RiskComparisonPanel riskResult={riskResult} entityLabel={entityLabel} />}
+    </div>
+  );
+}
+
+function RiskMathPanel({ riskResult, entityLabel }: { riskResult: RiskResult; entityLabel: string }) {
+  const color = riskBandColor(riskResult.math_baseline_band);
+  return (
+    <div className="forecast-method-panel">
+      <div className="method-panel-intro">
+        <span className="method-kicker">01 · transparent starting point</span>
+        <h4>The math asks: how often has this entity had a risky month before?</h4>
+        <p>
+          This is deliberately simple. It does not discover hidden patterns. It remembers the entity&apos;s own earlier labelled months and uses that history as a fair baseline for the next one.
+        </p>
+      </div>
+
+      <div className="method-step-grid">
+        <div className="method-step-card">
+          <span>STEP 1</span>
+          <strong>Define “risky”</strong>
+          <p>{riskResult.risk_threshold_definition}</p>
+        </div>
+        <div className="method-step-card">
+          <span>STEP 2</span>
+          <strong>Look at earlier months</strong>
+          <p>For {entityLabel}, count how many earlier labelled months were in that risky group.</p>
+        </div>
+        <div className="method-step-card">
+          <span>STEP 3</span>
+          <strong>Turn the count into a rate</strong>
+          <p>A small smoothing adjustment prevents a tiny history from producing an overconfident 0% or 100% answer.</p>
+        </div>
+      </div>
+
+      <div className="method-formula-grid">
+        <div>
+          <span>Plain formula</span>
+          <code>(risky earlier months + 1) ÷ (earlier labelled months + 2)</code>
+        </div>
+        <div>
+          <span>Math estimate</span>
+          <strong style={{ color }}>{formatPercent(riskResult.math_baseline_probability, 0)}</strong>
+        </div>
+        <div>
+          <span>Simple label</span>
+          <strong style={{ color }}>{riskBandLabel(riskResult.math_baseline_band)}</strong>
+        </div>
+      </div>
+
+      <div className="method-context-note">
+        <strong>In everyday words:</strong> if this carrier or airport has often had difficult months before, the baseline starts higher. If it has no earlier labelled history, it uses the overall bad-month rate from the training panel instead.
+      </div>
+      <div className="method-proof-row">
+        <span>{entityLabel} · latest observed period {riskResult.as_of_period}</span>
+        <span>History-based estimate · not a causal claim</span>
+      </div>
+    </div>
+  );
+}
+
+function RiskMLPanel({ riskResult, entityLabel }: { riskResult: RiskResult; entityLabel: string }) {
+  const color = riskBandColor(riskResult.risk_band);
+  const drivers = [...riskResult.model_coefficients]
+    .sort((a, b) => Math.abs(b.standardized_coefficient) - Math.abs(a.standardized_coefficient))
+    .slice(0, 3);
+
+  return (
+    <div className="forecast-method-panel">
+      <div className="method-panel-intro">
+        <span className="method-kicker">02 · learned pattern</span>
+        <h4>The ML model combines several signals at once.</h4>
+        <p>
+          It learns from earlier entity-month records, then estimates whether the following month will be unusually difficult. The model is more flexible than the baseline, but the later test is what tells us whether that extra complexity helped.
+        </p>
+      </div>
+
+      <div className="method-score-grid">
+        <div>
+          <span>ML probability</span>
+          <strong style={{ color }}>{formatPercent(riskResult.risk_probability, 0)}</strong>
+        </div>
+        <div>
+          <span>ML label</span>
+          <strong style={{ color }}>{riskBandLabel(riskResult.risk_band)}</strong>
+        </div>
+        <div>
+          <span>Calibration</span>
+          <strong>{riskResult.calibration_status === "fit" ? "Checked" : "Limited"}</strong>
+        </div>
+      </div>
+
+      <div className="method-context-note">
+        <strong>How to read it:</strong> the model gives each signal a weight, adds the weighted signals together, and converts the result into a probability. “Higher risk” drivers push the estimate up; “lower risk” drivers push it down.
+      </div>
+
+      <p className="eyebrow" style={{ margin: "1.15rem 0 0.7rem" }}>The three strongest signals for {entityLabel}</p>
+      <div className="method-step-grid">
+        {drivers.map((driver, index) => (
+          <div className="method-step-card" key={driver.feature}>
+            <span>DRIVER {String(index + 1).padStart(2, "0")}</span>
+            <strong>{FEATURE_LABELS[driver.feature] ?? driver.feature}</strong>
+            <p>
+              Current value: {riskResult.current_features[driver.feature]?.toFixed(driver.feature === "average_departure_delay" ? 1 : 3) ?? "—"}. This signal pushes risk {driver.direction === "higher_risk" ? "up" : "down"} in the learned model.
+            </p>
+          </div>
+        ))}
+      </div>
+
+      <div className="method-score-grid">
+        <div>
+          <span>Entities learned from</span>
+          <strong>{riskResult.entities_in_training_panel}</strong>
+        </div>
+        <div>
+          <span>Later examples tested</span>
+          <strong>{riskResult.split.test_examples}</strong>
+        </div>
+        <div>
+          <span>Test PR-AUC</span>
+          <strong>{riskResult.test_metrics.precision_recall_auc.toFixed(3)}</strong>
+        </div>
+      </div>
+
+      <p className="page-note" style={{ marginTop: "0.75rem" }}>
+        Training used data through {riskResult.split.train_end}; the final check used only later periods. A higher PR-AUC means better ranking of difficult months than a random ordering, but it is not a guarantee for one entity.
+      </p>
+
+      {riskResult.test_metrics.calibration_bins.length > 0 && (
+        <div className="method-comparison-table-wrap">
+          <p className="eyebrow" style={{ marginBottom: "0.55rem" }}>Did predicted groups resemble what happened?</p>
+          <table className="method-comparison-table">
+            <thead><tr><th>Predicted group</th><th>Examples</th><th>Average estimate</th><th>Observed risky rate</th></tr></thead>
+            <tbody>
+              {riskResult.test_metrics.calibration_bins.map((bin) => (
+                <tr key={bin.probability_band}>
+                  <th>{bin.probability_band}</th>
+                  <td>{bin.count}</td>
+                  <td>{formatPercent(bin.mean_predicted_probability)}</td>
+                  <td>{formatPercent(bin.observed_risk_rate)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="page-note" style={{ marginTop: "0.55rem" }}>Closer predicted and observed percentages mean the probability is behaving more sensibly.</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RiskComparisonPanel({ riskResult, entityLabel }: { riskResult: RiskResult; entityLabel: string }) {
+  const mlBetter = riskResult.model_selection.ml_better_on;
+  const verdict = mlBetter.length > 0
+    ? `ML improves the held-out ${mlBetter.join(" and ")} score${mlBetter.length === 1 ? "" : "s"} against the math baseline. That means the added signals helped on later examples in this run.`
+    : "The simple math baseline is not beaten on the held-out probability scores shown here. Keep the ML output exploratory until a wider or repeated evaluation shows a clear improvement.";
+  const rows: Array<{ label: string; math: number; ml: number; metric: "brier_score" | "log_loss" | "precision_recall_auc" }> = [
+    { label: "Brier score · lower is better", math: riskResult.baseline_test_metrics.brier_score, ml: riskResult.test_metrics.brier_score, metric: "brier_score" },
+    { label: "Log loss · lower is better", math: riskResult.baseline_test_metrics.log_loss, ml: riskResult.test_metrics.log_loss, metric: "log_loss" },
+    { label: "PR-AUC · higher is better", math: riskResult.baseline_test_metrics.precision_recall_auc, ml: riskResult.test_metrics.precision_recall_auc, metric: "precision_recall_auc" },
+  ];
+
+  return (
+    <div className="forecast-method-panel">
+      <div className="method-panel-intro">
+        <span className="method-kicker">03 · evidence before preference</span>
+        <h4>Which answer deserves more attention?</h4>
+        <p>
+          The two methods answer the same question for {entityLabel}, but they use different amounts of information. We choose between them by looking at later labelled months neither method was allowed to learn from.
+        </p>
+      </div>
+
+      <div className="method-score-grid">
+        <div>
+          <span>Math probability</span>
+          <strong style={{ color: riskBandColor(riskResult.math_baseline_band) }}>{formatPercent(riskResult.math_baseline_probability, 0)}</strong>
+        </div>
+        <div>
+          <span>ML probability</span>
+          <strong style={{ color: riskBandColor(riskResult.risk_band) }}>{formatPercent(riskResult.risk_probability, 0)}</strong>
+        </div>
+        <div>
+          <span>Test examples</span>
+          <strong>{riskResult.split.test_examples}</strong>
+        </div>
+      </div>
+
+      <div className="method-context-note">
+        <strong>Decision read:</strong> {verdict}
+      </div>
+
+      <div className="method-comparison-table-wrap">
+        <table className="method-comparison-table">
+          <thead><tr><th>Held-out check</th><th>Math baseline</th><th>ML model</th><th>Winner</th></tr></thead>
+          <tbody>
+            {rows.map((row) => (
+              <tr key={row.metric}>
+                <th>{row.label}</th>
+                <td>{row.math.toFixed(3)}</td>
+                <td>{row.ml.toFixed(3)}</td>
+                <td>{riskMetricWinner(row.metric, row.math, row.ml)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="method-proof-row">
+        <span>ML wins probability metrics: {mlBetter.length ? mlBetter.join(", ") : "none in this run"}</span>
+        <span>Training ends {riskResult.split.train_end} · test begins after {riskResult.split.validation_end}</span>
+      </div>
+      <p className="page-note" style={{ marginTop: "0.75rem" }}>
+        Lower Brier and log loss mean the probabilities were closer to the outcomes. Higher PR-AUC means better ranking. This is evidence for model selection, not proof that either method can see the future.
+      </p>
+    </div>
   );
 }
 

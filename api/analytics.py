@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from api.health_score import score_from_row
+
 
 def table_exists(connection: Any, table_name: str) -> bool:
     row = connection.execute(
@@ -194,4 +196,133 @@ def route_hour_baseline(
         "median_arrival_delay_minutes": row[4],
         "p90_arrival_delay_minutes": row[5],
         "cancellation_rate": row[6],
+    }
+
+
+# The profile tables are deliberately explicit.  They are a small, stable
+# contract between the refresh pipeline and the public profile pages; the
+# researcher endpoints continue to use their richer raw-flight path.
+PROFILE_STAT_COLUMNS = (
+    "total_flights",
+    "completed_flights",
+    "avg_arrival_delay",
+    "var_arrival_delay",
+    "on_time_percentage",
+    "var_on_time_indicator",
+    "severe_delay_percentage",
+    "var_severe_indicator",
+    "cancellation_percentage",
+    "var_cancelled_indicator",
+    "diversion_percentage",
+    "var_diverted_indicator",
+)
+
+
+def _has_columns(connection: Any, table_name: str, required: set[str]) -> bool:
+    if not table_exists(connection, table_name):
+        return False
+    columns = {row[0] for row in connection.execute(f"DESCRIBE {table_name}").fetchall()}
+    return required.issubset(columns)
+
+
+def _public_profile_health(connection: Any, table_name: str, key_column: str, key: str) -> dict | None:
+    if not _has_columns(connection, table_name, set(PROFILE_STAT_COLUMNS) | {key_column}):
+        return None
+    row = connection.execute(
+        f"SELECT {', '.join(PROFILE_STAT_COLUMNS)} FROM {table_name} WHERE {key_column} = ?",
+        [key],
+    ).fetchone()
+    return score_from_row(row) if row else None
+
+
+def carrier_public_profile(connection: Any, carrier: str) -> dict[str, Any] | None:
+    """Return the compact, full-history payload needed by the public carrier page."""
+    if not _has_columns(connection, "analytics_carrier_month", {"carrier", "year_month", "total_flights", "completed_flights", "on_time_rate", "avg_arrival_delay_minutes", "cancellation_rate"}):
+        return None
+    health = _public_profile_health(connection, "analytics_carrier_profile", "carrier", carrier)
+    if health is None:
+        return None
+    row = connection.execute(
+        """
+        SELECT SUM(total_flights),
+               SUM(completed_flights * on_time_rate) / NULLIF(SUM(completed_flights), 0),
+               SUM(completed_flights * avg_arrival_delay_minutes) / NULLIF(SUM(completed_flights), 0),
+               SUM(total_flights * cancellation_rate) / NULLIF(SUM(total_flights), 0)
+        FROM analytics_carrier_month
+        WHERE carrier = ?
+        """,
+        [carrier],
+    ).fetchone()
+    if not row or not row[0]:
+        return None
+    months = connection.execute(
+        """
+        SELECT year_month, total_flights, on_time_rate
+        FROM analytics_carrier_month
+        WHERE carrier = ?
+        ORDER BY year_month
+        """,
+        [carrier],
+    ).fetchall()
+    return {
+        "carrier": carrier,
+        "total_flights": int(row[0]),
+        "on_time_rate": row[1],
+        "avg_arrival_delay_minutes": row[2],
+        "cancellation_rate": row[3],
+        "health": health,
+        "months": [{"month": r[0], "total_flights": int(r[1]), "on_time_rate": r[2]} for r in months],
+        "causes": [],
+        "top_routes": [],
+        "top_airports": [],
+    }
+
+
+def airport_public_profile(connection: Any, airport: str) -> dict[str, Any] | None:
+    """Return the compact, full-history payload needed by the public airport page."""
+    required_month_columns = {
+        "airport", "year_month", "total_flights", "completed_flights", "on_time_rate",
+        "avg_arrival_delay_minutes", "cancellation_rate",
+    }
+    if not _has_columns(connection, "analytics_airport_profile_month", required_month_columns):
+        return None
+    health = _public_profile_health(connection, "analytics_airport_profile", "airport", airport)
+    if health is None:
+        return None
+    row = connection.execute(
+        """
+        SELECT SUM(total_flights),
+               SUM(completed_flights * on_time_rate) / NULLIF(SUM(completed_flights), 0),
+               SUM(completed_flights * avg_arrival_delay_minutes) / NULLIF(SUM(completed_flights), 0),
+               SUM(total_flights * cancellation_rate) / NULLIF(SUM(total_flights), 0)
+        FROM analytics_airport_profile_month
+        WHERE airport = ?
+        """,
+        [airport],
+    ).fetchone()
+    if not row or not row[0]:
+        return None
+    months = connection.execute(
+        """
+        SELECT year_month, total_flights, on_time_rate
+        FROM analytics_airport_profile_month
+        WHERE airport = ?
+        ORDER BY year_month
+        """,
+        [airport],
+    ).fetchall()
+    return {
+        "airport": airport,
+        "city": None,
+        "state": None,
+        "total_flights": int(row[0]),
+        "on_time_rate": row[1],
+        "avg_arrival_delay_minutes": row[2],
+        "cancellation_rate": row[3],
+        "health": health,
+        "outbound": None,
+        "inbound": None,
+        "months": [{"month": r[0], "total_flights": int(r[1]), "on_time_rate": r[2]} for r in months],
+        "causes": [],
+        "top_routes": [],
     }

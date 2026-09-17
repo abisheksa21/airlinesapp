@@ -49,6 +49,34 @@ def main() -> None:
             """
         ).fetchone()[0]
 
+        core_table = "analytics_flight_core"
+        core_exists = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM information_schema.tables
+            WHERE table_name = ?
+            """,
+            [core_table],
+        ).fetchone()[0] > 0
+        core_row_count = None
+        core_column_count = None
+        if core_exists:
+            core_row_count = connection.execute(
+                f"SELECT COUNT(*) FROM {core_table}"
+            ).fetchone()[0]
+            core_column_count = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM information_schema.columns
+                WHERE table_name = ?
+                """,
+                [core_table],
+            ).fetchone()[0]
+            if core_row_count != row_count:
+                raise RuntimeError(
+                    f"Compact OTP layer row count {core_row_count:,} does not match flights row count {row_count:,}."
+                )
+
         date_range = connection.execute(
             """
             SELECT
@@ -129,6 +157,11 @@ def main() -> None:
 
         print(f"Rows              : {row_count:,}")
         print(f"Columns           : {column_count}")
+        if core_exists:
+            print(f"Compact OTP rows  : {core_row_count:,}")
+            print(f"Compact OTP cols  : {core_column_count}")
+        else:
+            print("Compact OTP layer : not materialized (run pipeline.materialize_analytics)")
         print(f"Date range        : {date_range[0]} to {date_range[1]}")
         print(f"Year-month periods: {month_count}")
         print(f"Null FlightDate   : {null_date_count:,}")

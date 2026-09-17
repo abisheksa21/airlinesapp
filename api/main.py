@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 
 from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,10 +19,22 @@ from api.copilot import get_summary as copilot_get_summary
 from api.copilot import get_trend as copilot_get_trend
 from api.copilot import compare_carriers as copilot_compare_carriers
 from api.copilot import get_delay_causes as copilot_get_delay_causes
-from api.db import database_path, open_readonly_connection
+from api.db import best_flight_table, database_path, open_readonly_connection
 from config import DEFAULT_HEAVY_LOOKBACK_DAYS, DEFAULT_MODEL_LOOKBACK_DAYS, PIPELINE_STATE_FILE, T100_PIPELINE_STATE_FILE
 from api.metrics import COMPLETED_FLIGHT_SQL, ON_TIME_FLAG_SQL
-from api.analytics import airport_list, airport_ranking, carrier_ranking, network_summary, network_trend, route_hour_baseline, route_ranking
+from api.analytics import (
+    airport_list,
+    airport_public_profile,
+    airport_ranking,
+    carrier_public_profile,
+    carrier_ranking,
+    network_summary,
+    network_trend,
+    route_hour_baseline,
+    route_ranking,
+)
+from api.route_forecast import build_route_forecast
+from api.route_ml_forecast import build_route_ml_forecast, build_route_panel_ml_forecast
 from api import predictive_risk
 from api.health_score import compute_health_score, score_from_row, RAW_STAT_SELECT_EXPRS
 from api.delay_propagation_markov import get_delay_propagation_markov, STATES as MARKOV_STATES
@@ -158,6 +171,51 @@ _HEALTH_SCORE_WEIGHTS = {
     "diversion_resilience": 0.059,
 }
 
+_CARRIER_HEALTH_PANEL_CACHE: tuple[float, dict[str, dict]] | None = None
+_CARRIER_HEALTH_PANEL_LOCK = threading.Lock()
+CARRIER_HEALTH_PANEL_CACHE_TTL_SECONDS = 600
+
+
+def _carrier_health_panel() -> dict[str, dict]:
+    """Compute every carrier's Health Score from one grouped warehouse scan.
+
+    The Decision Center needs the selected carrier and the peer medians. The
+    old implementation called compute_health_score once per carrier, causing
+    the same 60M-row table to be scanned repeatedly before the browser could
+    render a result. Grouping by carrier preserves the exact raw aggregates;
+    score_from_row then applies the unchanged Health Score mathematics to each
+    aggregate row.
+    """
+    global _CARRIER_HEALTH_PANEL_CACHE
+    with _CARRIER_HEALTH_PANEL_LOCK:
+        now = time.monotonic()
+        if (
+            _CARRIER_HEALTH_PANEL_CACHE is not None
+            and now - _CARRIER_HEALTH_PANEL_CACHE[0] < CARRIER_HEALTH_PANEL_CACHE_TTL_SECONDS
+        ):
+            return _CARRIER_HEALTH_PANEL_CACHE[1]
+
+        with open_readonly_connection() as connection:
+            source_table = best_flight_table(
+                connection,
+                {"Marketing_Airline_Network", "Cancelled", "Diverted", "ArrDelay", "ArrDel15"},
+            )
+            query = f"""
+                SELECT Marketing_Airline_Network AS carrier, {RAW_STAT_SELECT_EXPRS}
+                FROM {source_table}
+                WHERE Marketing_Airline_Network IS NOT NULL
+                GROUP BY Marketing_Airline_Network
+            """
+            rows = connection.execute(query).fetchall()
+
+        scores: dict[str, dict] = {}
+        for row in rows:
+            score = score_from_row(row[1:])
+            if score is not None:
+                scores[str(row[0])] = score
+        _CARRIER_HEALTH_PANEL_CACHE = (time.monotonic(), scores)
+        return scores
+
 
 @app.get("/api/decision/health-improvement")
 def health_improvement_endpoint(carrier: str = Query(...)):
@@ -165,23 +223,13 @@ def health_improvement_endpoint(carrier: str = Query(...)):
 
     carrier = carrier.upper()
 
-    entity_health = compute_health_score("Marketing_Airline_Network = ?", [carrier])
+    carrier_health = _carrier_health_panel()
+    entity_health = carrier_health.get(carrier)
     if entity_health is None:
         raise HTTPException(status_code=404, detail="No flights found for that carrier.")
 
-    with open_readonly_connection() as connection:
-        all_carriers = [
-            r[0]
-            for r in connection.execute(
-                "SELECT DISTINCT Marketing_Airline_Network FROM flights WHERE Marketing_Airline_Network IS NOT NULL"
-            ).fetchall()
-        ]
-
     peer_component_scores: dict[str, list[float]] = {c: [] for c in _HEALTH_SCORE_WEIGHTS}
-    for code in all_carriers:
-        h = compute_health_score("Marketing_Airline_Network = ?", [code])
-        if h is None:
-            continue
+    for h in carrier_health.values():
         for component in _HEALTH_SCORE_WEIGHTS:
             peer_component_scores[component].append(h["component_scores"][component])
 
@@ -214,7 +262,7 @@ def health_improvement_endpoint(carrier: str = Query(...)):
         "carrier": carrier,
         "current_score": entity_health["score"],
         "current_rating": entity_health["rating"],
-        "peer_count": len(all_carriers),
+        "peer_count": len(carrier_health),
         "levers": levers,
     }
 
@@ -237,19 +285,7 @@ def opportunity_ranking_endpoint():
     not inventing a fake single ranking metric."""
     import statistics
 
-    with open_readonly_connection() as connection:
-        all_carriers = [
-            r[0]
-            for r in connection.execute(
-                "SELECT DISTINCT Marketing_Airline_Network FROM flights WHERE Marketing_Airline_Network IS NOT NULL"
-            ).fetchall()
-        ]
-
-    carrier_health: dict[str, dict] = {}
-    for code in all_carriers:
-        h = compute_health_score("Marketing_Airline_Network = ?", [code])
-        if h is not None:
-            carrier_health[code] = h
+    carrier_health = _carrier_health_panel()
 
     peer_component_scores: dict[str, list[float]] = {c: [] for c in _HEALTH_SCORE_WEIGHTS}
     for h in carrier_health.values():
@@ -336,22 +372,24 @@ def network_protection_portfolio_endpoint(
     # not the MILP solve, is what made this endpoint appear to hang: it's
     # I/O-bound work multiplied by candidate count, not a slow solver --
     # confirmed by profiling (CPU near-idle while the request was pending).
-    group_query = f"""
-        SELECT {entity_col} AS entity, {RAW_STAT_SELECT_EXPRS}
-        FROM flights
-        WHERE {entity_col} IS NOT NULL
-        GROUP BY {entity_col}
-    """
-    if candidate_type == "airport":
-        # Airports: hundreds of distinct values -- keep the busiest-N
-        # pre-filter, but as an ORDER BY/LIMIT on this SAME grouped scan
-        # rather than a second full-table-scan query beforehand.
-        group_query += " ORDER BY total_flights DESC LIMIT ?"
-        group_params = [airport_candidate_limit]
-    else:
-        group_params = []
+    # Airports: hundreds of distinct values -- keep the busiest-N pre-filter,
+    # but apply it to the same grouped scan rather than scanning the source a
+    # second time beforehand.
+    group_params = [airport_candidate_limit] if candidate_type == "airport" else []
 
     with open_readonly_connection() as connection:
+        source_table = best_flight_table(
+            connection,
+            {entity_col, "Cancelled", "Diverted", "ArrDelay", "ArrDel15"},
+        )
+        group_query = f"""
+            SELECT {entity_col} AS entity, {RAW_STAT_SELECT_EXPRS}
+            FROM {source_table}
+            WHERE {entity_col} IS NOT NULL
+            GROUP BY {entity_col}
+        """
+        if candidate_type == "airport":
+            group_query += " ORDER BY total_flights DESC LIMIT ?"
         group_rows = connection.execute(group_query, group_params).fetchall()
 
     candidates: list[InterventionCandidate] = []
@@ -2549,132 +2587,95 @@ def route_forecast(
     dest: str = Query(...),
     carrier: Optional[str] = Query(None),
     departure_hour: Optional[int] = Query(None, ge=0, le=23),
+    target_month: Optional[str] = Query(
+        None,
+        description="Target month in YYYY-MM format. Defaults to the month after the latest observation.",
+    ),
 ):
-    """Return a transparent historical delay baseline for one route scenario.
+    """Return a leakage-safe historical forecast for one route scenario.
 
-    This is deliberately not presented as a weather or machine-learning
-    forecast.  It answers the first useful question from the public view:
-    "How have comparable flights performed historically?"  If the most
-    specific route + carrier + departure-hour slice is too small, step back
-    to a larger route slice and disclose that fallback in the response.
+    The model uses only observations before target_month. It first tries the
+    requested route + airline + departure-hour slice, widens the comparison
+    when the completed-flight sample is too small, and discloses that choice.
     """
-    origin = origin.upper()
-    dest = dest.upper()
-    carrier = carrier.upper() if carrier else None
+    try:
+        with open_readonly_connection() as connection:
+            return build_route_forecast(
+                connection,
+                origin=origin,
+                dest=dest,
+                carrier=carrier,
+                departure_hour=departure_hour,
+                target_month=target_month,
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    base_clauses = ["Origin = ?", "Dest = ?"]
-    base_params: list = [origin, dest]
 
-    # Try the most specific useful comparison first.  A minimum of 30
-    # completed flights avoids presenting a handful of flights as a stable
-    # expectation while keeping common routes easy to explore.
-    candidates: list[tuple[str, list[str], list]] = []
-    if carrier and departure_hour is not None:
-        candidates.append(("route + airline + departure hour", [*base_clauses, "Marketing_Airline_Network = ?", "CAST(FLOOR(CRSDepTime / 100) AS INTEGER) = ?"], [*base_params, carrier, departure_hour]))
-    if carrier:
-        candidates.append(("route + airline", [*base_clauses, "Marketing_Airline_Network = ?"], [*base_params, carrier]))
-    if departure_hour is not None:
-        candidates.append(("route + departure hour", [*base_clauses, "CAST(FLOOR(CRSDepTime / 100) AS INTEGER) = ?"], [*base_params, departure_hour]))
-    candidates.append(("route", [*base_clauses], [*base_params]))
+@app.get("/api/route-ml-forecast")
+def route_ml_forecast(
+    origin: str = Query(...),
+    dest: str = Query(...),
+    carrier: Optional[str] = Query(None),
+    departure_hour: Optional[int] = Query(None, ge=0, le=23),
+    target_month: Optional[str] = Query(
+        None,
+        description="Target month in YYYY-MM format. Defaults to the month after the latest observation.",
+    ),
+):
+    """Return the first leakage-safe ML forecast for one route scenario.
 
-    result = None
-    matched_scope = "route"
-    with open_readonly_connection() as connection:
-        # The exact, most-specific slice is pre-aggregated during the warehouse
-        # build. Use it when available so the common public-view question does
-        # not rescan the tens-of-millions-row raw table.
-        if carrier and departure_hour is not None:
-            fast = route_hour_baseline(connection, origin, dest, carrier, departure_hour)
-            if fast and fast["completed_flights"] >= 30:
-                result = (
-                    fast["total_flights"], fast["completed_flights"], fast["on_time_rate"],
-                    fast["avg_arrival_delay_minutes"], fast["median_arrival_delay_minutes"],
-                    fast["p90_arrival_delay_minutes"], fast["cancellation_rate"],
-                )
-                matched_scope = "route + airline + departure hour"
+    This is intentionally a separate researcher-facing endpoint while the
+    public route forecast remains the transparent historical/T-100 baseline.
+    The response includes held-out metrics, target features, coefficients, and
+    training cutoff so the model can be reviewed before it becomes a default.
+    """
+    try:
+        with open_readonly_connection() as connection:
+            return build_route_ml_forecast(
+                connection,
+                origin=origin,
+                dest=dest,
+                carrier=carrier,
+                departure_hour=departure_hour,
+                target_month=target_month,
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-        for scope, clauses, params in candidates:
-            if result is not None:
-                break
-            where = " AND ".join(clauses)
-            row = connection.execute(
-                f"""
-                SELECT
-                    COUNT(*) AS total_flights,
-                    COUNT(*) FILTER (WHERE Cancelled = 0 AND ArrDelay IS NOT NULL) AS completed_flights,
-                    AVG(CASE WHEN Cancelled = 0 THEN CASE WHEN ArrDel15 = 0 THEN 1.0 ELSE 0.0 END END) AS on_time_rate,
-                    AVG(CASE WHEN Cancelled = 0 THEN ArrDelay END) AS avg_arrival_delay_minutes,
-                    quantile_cont(ArrDelay, 0.50) FILTER (WHERE Cancelled = 0 AND ArrDelay IS NOT NULL) AS median_arrival_delay_minutes,
-                    quantile_cont(ArrDelay, 0.90) FILTER (WHERE Cancelled = 0 AND ArrDelay IS NOT NULL) AS p90_arrival_delay_minutes,
-                    AVG(Cancelled * 1.0) AS cancellation_rate
-                FROM flights
-                WHERE {where}
-                """,
-                params,
-            ).fetchone()
-            if row and row[0] and row[1] >= 30:
-                result = row
-                matched_scope = scope
-                break
 
-        if result is None:
-            # Return the route-level row when the route exists but all slices
-            # are small; this produces a useful answer with an honest sample
-            # size instead of a misleading 404.
-            where = " AND ".join(base_clauses)
-            result = connection.execute(
-                f"""
-                SELECT
-                    COUNT(*) AS total_flights,
-                    COUNT(*) FILTER (WHERE Cancelled = 0 AND ArrDelay IS NOT NULL) AS completed_flights,
-                    AVG(CASE WHEN Cancelled = 0 THEN CASE WHEN ArrDel15 = 0 THEN 1.0 ELSE 0.0 END END) AS on_time_rate,
-                    AVG(CASE WHEN Cancelled = 0 THEN ArrDelay END) AS avg_arrival_delay_minutes,
-                    quantile_cont(ArrDelay, 0.50) FILTER (WHERE Cancelled = 0 AND ArrDelay IS NOT NULL) AS median_arrival_delay_minutes,
-                    quantile_cont(ArrDelay, 0.90) FILTER (WHERE Cancelled = 0 AND ArrDelay IS NOT NULL) AS p90_arrival_delay_minutes,
-                    AVG(Cancelled * 1.0) AS cancellation_rate
-                FROM flights
-                WHERE {where}
-                """,
-                base_params,
-            ).fetchone()
+@app.get("/api/route-panel-forecast")
+def route_panel_forecast(
+    origin: str = Query(...),
+    dest: str = Query(...),
+    target_month: Optional[str] = Query(
+        None,
+        description="Target month in YYYY-MM format. Defaults to the month after the latest route-month observation.",
+    ),
+):
+    """Score a route with a model trained across the network route panel.
 
-    if not result or not result[0]:
-        raise HTTPException(status_code=404, detail="No flights found for that route.")
+    This remains researcher-facing while it is benchmarked against the
+    transparent route baseline. The panel is deliberately route-level, so an
+    airline or departure-hour filter is not accepted by this endpoint.
+    """
+    try:
+        with open_readonly_connection() as connection:
+            return build_route_panel_ml_forecast(
+                connection,
+                origin=origin,
+                dest=dest,
+                target_month=target_month,
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    requested_scope = "route"
-    if carrier and departure_hour is not None:
-        requested_scope = "route + airline + departure hour"
-    elif carrier:
-        requested_scope = "route + airline"
-    elif departure_hour is not None:
-        requested_scope = "route + departure hour"
-
-    completed = int(result[1] or 0)
-    if completed >= 500:
-        confidence = "strong historical sample"
-    elif completed >= 100:
-        confidence = "useful historical sample"
-    else:
-        confidence = "small historical sample"
-
-    return {
-        "origin": origin,
-        "dest": dest,
-        "carrier": carrier,
-        "departure_hour": departure_hour,
-        "requested_scope": requested_scope,
-        "matched_scope": matched_scope,
-        "used_fallback": matched_scope != requested_scope,
-        "total_flights": int(result[0]),
-        "completed_flights": completed,
-        "on_time_rate": result[2],
-        "avg_arrival_delay_minutes": result[3],
-        "median_arrival_delay_minutes": result[4],
-        "p90_arrival_delay_minutes": result[5],
-        "cancellation_rate": result[6],
-        "confidence": confidence,
-        "interpretation": "A historical baseline from comparable BTS flights. It is not a promise and does not yet use weather, live conditions, or a machine-learning model.",
-    }
 
 
 @app.get("/api/carrier-detail")
@@ -2683,6 +2684,7 @@ def carrier_detail(
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
     limit: int = 10,
+    summary_only: bool = Query(False),
 ):
     """Full profile for one specific carrier: overall stats, monthly trend,
     delay causes, and busiest routes/airports. Brought up to parity with
@@ -2691,6 +2693,16 @@ def carrier_detail(
     /api/delay-causes with carrier= set, which worked for the existing
     lookup flow but wasn't a single self-contained profile."""
     carrier = carrier.upper()
+
+    # Public pages only need headline metrics, trend, and health. The refresh
+    # pipeline materializes those once, so a public profile visit does not
+    # rescan the raw flight table. Date-filtered requests remain on the full
+    # researcher path below.
+    if summary_only and not start_date and not end_date:
+        with open_readonly_connection() as connection:
+            compact = carrier_public_profile(connection, carrier)
+        if compact is not None:
+            return compact
 
     clauses = ["Marketing_Airline_Network = ?"]
     params: list = [carrier]
@@ -2813,10 +2825,17 @@ def airport_detail(
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
     limit: int = 10,
+    summary_only: bool = Query(False),
 ):
     """Full profile for one specific airport: combined + inbound/outbound
     stats, monthly trend, delay causes, and busiest routes through it."""
     airport = airport.upper()
+
+    if summary_only and not start_date and not end_date:
+        with open_readonly_connection() as connection:
+            compact = airport_public_profile(connection, airport)
+        if compact is not None:
+            return compact
 
     date_clauses = []
     date_params: list = []

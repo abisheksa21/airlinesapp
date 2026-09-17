@@ -106,7 +106,12 @@ function CarrierProfilePageInner() {
     setNotFound(false);
     setError(false);
     try {
-      const qs = buildQuery({ carrier: code, start_date: startDate, end_date: endDate });
+      const qs = buildQuery({
+        carrier: code,
+        start_date: startDate,
+        end_date: endDate,
+        summary_only: mode === "public" ? "true" : "",
+      });
       const res = await fetch(`${API_BASE}/api/carrier-detail${qs}`);
       if (token !== loadTokenRef.current) return; // a newer request has since started -- discard this one
       if (res.status === 404) {
@@ -124,15 +129,18 @@ function CarrierProfilePageInner() {
       if (mode === "researcher") {
         const autoG = autoGranularity(startDate, endDate);
         setPaddingGranularity(autoG);
-        await fetchPadding(autoG);
-        if (token !== loadTokenRef.current) return;
-        try {
-          const csRes = await fetch(`${API_BASE}/api/codeshare${qs}`);
-          if (token !== loadTokenRef.current) return;
-          setCodeshare(csRes.ok ? await csRes.json() : null);
-        } catch {
-          if (token === loadTokenRef.current) setCodeshare(null);
-        }
+        await Promise.all([
+          fetchPadding(autoG),
+          (async () => {
+            try {
+              const csRes = await fetch(`${API_BASE}/api/codeshare${qs}`);
+              if (token !== loadTokenRef.current) return;
+              setCodeshare(csRes.ok ? await csRes.json() : null);
+            } catch {
+              if (token === loadTokenRef.current) setCodeshare(null);
+            }
+          })(),
+        ]);
       }
     } catch {
       if (token === loadTokenRef.current) setError(true);
@@ -187,7 +195,11 @@ function CarrierProfilePageInner() {
 
       {notFound && <p className="error-text">No flights found for {code} in that range.</p>}
       {error && <p className="error-text">Could not load this profile &mdash; check the API is running.</p>}
-      {!detail && !notFound && !error && <p className="error-text">Loading...</p>}
+      {!detail && !notFound && !error && (mode === "researcher" || publicTab !== "About") && (
+        <p className="profile-page-loading" role="status" aria-live="polite">
+          <span className="loading-pulse" /> Loading measured performance for {code}…
+        </p>
+      )}
 
       {mode === "public" && (
         <section className="section">

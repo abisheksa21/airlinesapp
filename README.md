@@ -96,6 +96,13 @@ python -m pipeline.materialize_analytics
 This makes the public rankings and the historical route baseline fast without
 changing the underlying data or analytical definitions.
 
+The rebuild also creates `analytics_flight_core`, an explicit 43-column OTP
+projection used by the repeated health, route, and predictive-risk queries.
+The complete `flights` table remains available as the source of truth for
+specialist analyses; the compact layer is a performance and feature contract,
+not a replacement dataset. `python -m pipeline.validate` checks that its row
+count matches `flights` before the warehouse is trusted.
+
 ### Optional — add real BTS capacity and identity data
 
 The app can be enriched with official BTS T-100 Segment/Market data and the
@@ -119,8 +126,26 @@ month depends on what BTS has published when the command is run; the local
 warehouse used for this project currently contains T-100 through May 2026 and
 OTP through June 2026.
 
-The API exposes the resulting provenance through `/api/data-sources`, route-month
-capacity context through `/api/capacity/summary`, a grain-matched T-100 vs.
+The API exposes the resulting provenance through `/api/data-sources`, a
+leakage-safe route-delay baseline with optional T-100 traffic context through
+`/api/route-forecast`, and a separate researcher-only route ML candidate through
+`/api/route-ml-forecast`. The ML endpoint predicts expected delay, late-arrival
+rate, and cancellation rate from prior route history and lagged T-100 context,
+then reports held-out metrics beside the baseline rather than silently replacing
+it. `/api/route-panel-forecast` provides the broader researcher benchmark,
+trained across the materialized route-month panel before scoring one route. It
+uses lagged T-100 context when the enrichment table is present, joined strictly
+before each OTP month; the researcher Routes page exposes the Math baseline,
+ML candidate, and side-by-side Comparison as separate tabs.
+The Predictive Risk screen follows the same pattern: a transparent historical
+baseline, the learned ML estimate, and a held-out Math-versus-ML comparison.
+This keeps the main decision readable while preserving the deeper model logic
+for researcher review.
+The researcher Routes comparison also runs a T-100 ablation: the same
+chronological ML test is repeated with lagged T-100 features removed. This
+shows whether the extra source lowers held-out error for any outcome instead of
+assuming that more features are automatically better.
+Route-month capacity context is available through `/api/capacity/summary`, a grain-matched T-100 vs.
 on-time comparison through `/api/capacity/correlation`, and a simple monthly
 trend through `/api/capacity/trend`. The Researcher view has both a dedicated
 T-100 page and a Decision Center tab for that comparison. T-100 freshness can

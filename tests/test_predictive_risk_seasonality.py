@@ -20,7 +20,13 @@ if "duckdb" not in sys.modules:
     _stub.DuckDBPyConnection = object
     sys.modules["duckdb"] = _stub
 
-from api.predictive_risk import build_supervised_examples, FEATURE_NAMES, _trend_and_seasonal
+from api.predictive_risk import (
+    FEATURE_NAMES,
+    _trend_and_seasonal,
+    build_supervised_examples,
+    historical_risk_baseline_probability,
+    historical_risk_baseline_probabilities,
+)
 
 
 class TestFeatureSetGrewCorrectly:
@@ -192,3 +198,46 @@ class TestThresholdDoesNotLeakFutureOutcomes:
         _, threshold_after, _ = build_supervised_examples(rows_after, risk_quantile=0.75)
 
         assert threshold_before == threshold_after
+
+
+class TestHistoricalRiskBaseline:
+    def test_new_entity_uses_panel_fallback(self):
+        rows = [{"entity": "NEW", "target_period": "2025-01", "label": 1}]
+        predictions = historical_risk_baseline_probabilities(
+            rows, known_history=[], fallback_probability=0.23
+        )
+        assert predictions.tolist() == [0.23]
+
+    def test_expanding_rate_uses_only_earlier_labels(self):
+        history = [{"entity": "AA", "target_period": "2024-01", "label": 1}]
+        rows = [
+            {"entity": "AA", "target_period": "2024-02", "label": 0},
+            {"entity": "AA", "target_period": "2024-03", "label": 1},
+        ]
+        predictions = historical_risk_baseline_probabilities(
+            rows, known_history=history, fallback_probability=0.10
+        )
+        # One earlier risky month: (1 + 1) / (1 + 2) = 2/3.
+        # The second row can see February's observed 0, but not its own label:
+        # (1 + 1) / (2 + 2) = 1/2.
+        assert predictions[0] == 2 / 3
+        assert predictions[1] == 1 / 2
+
+    def test_scored_rows_are_returned_in_original_order(self):
+        rows = [
+            {"entity": "AA", "target_period": "2024-03", "label": 0},
+            {"entity": "AA", "target_period": "2024-02", "label": 1},
+        ]
+        predictions = historical_risk_baseline_probabilities(
+            rows, known_history=[], fallback_probability=0.10
+        )
+        assert predictions.tolist() == [2 / 3, 0.10]
+
+    def test_single_entity_score_matches_same_baseline_formula(self):
+        history = [
+            {"entity": "AA", "target_period": "2024-01", "label": 1},
+            {"entity": "AA", "target_period": "2024-02", "label": 0},
+        ]
+        assert historical_risk_baseline_probability(
+            entity="AA", known_history=history, fallback_probability=0.10
+        ) == 0.5

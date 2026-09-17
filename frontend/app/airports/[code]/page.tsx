@@ -70,7 +70,12 @@ function AirportProfilePageInner() {
     setNotFound(false);
     setError(false);
     try {
-      const qs = buildQuery({ airport: code, start_date: startDate, end_date: endDate });
+      const qs = buildQuery({
+        airport: code,
+        start_date: startDate,
+        end_date: endDate,
+        summary_only: mode === "public" ? "true" : "",
+      });
       const res = await fetch(`${API_BASE}/api/airport-detail${qs}`);
       if (token !== loadTokenRef.current) return;
       if (res.status === 404) {
@@ -84,20 +89,26 @@ function AirportProfilePageInner() {
       setDetail(data);
 
       if (mode === "researcher") {
-        try {
-          const todRes = await fetch(`${API_BASE}/api/time-of-day${qs}`);
-          if (token !== loadTokenRef.current) return;
-          setTimeOfDay(todRes.ok ? (await todRes.json()).hours ?? null : null);
-        } catch {
-          if (token === loadTokenRef.current) setTimeOfDay(null);
-        }
-        try {
-          const tbRes = await fetch(`${API_BASE}/api/turnbacks${qs}`);
-          if (token !== loadTokenRef.current) return;
-          setTurnback(tbRes.ok ? await tbRes.json() : null);
-        } catch {
-          if (token === loadTokenRef.current) setTurnback(null);
-        }
+        await Promise.all([
+          (async () => {
+            try {
+              const todRes = await fetch(`${API_BASE}/api/time-of-day${qs}`);
+              if (token !== loadTokenRef.current) return;
+              setTimeOfDay(todRes.ok ? (await todRes.json()).hours ?? null : null);
+            } catch {
+              if (token === loadTokenRef.current) setTimeOfDay(null);
+            }
+          })(),
+          (async () => {
+            try {
+              const tbRes = await fetch(`${API_BASE}/api/turnbacks${qs}`);
+              if (token !== loadTokenRef.current) return;
+              setTurnback(tbRes.ok ? await tbRes.json() : null);
+            } catch {
+              if (token === loadTokenRef.current) setTurnback(null);
+            }
+          })(),
+        ]);
       }
     } catch {
       if (token === loadTokenRef.current) setError(true);
@@ -143,7 +154,11 @@ function AirportProfilePageInner() {
 
       {notFound && <p className="error-text">No flights found for {code} in that range.</p>}
       {error && <p className="error-text">Could not load this profile &mdash; check the API is running.</p>}
-      {!detail && !notFound && !error && <p className="error-text">Loading...</p>}
+      {!detail && !notFound && !error && (mode === "researcher" || publicTab !== "About") && (
+        <p className="profile-page-loading" role="status" aria-live="polite">
+          <span className="loading-pulse" /> Loading measured performance for {code}…
+        </p>
+      )}
 
       {mode === "public" && (
         <section className="section">
@@ -160,7 +175,7 @@ function AirportProfilePageInner() {
               <div className="public-profile-lede">
                 <p className="eyebrow">{publicTab === "Overview" ? "Plain-language read" : "Performance read"}</p>
                 <h2>{publicTab === "Overview" ? `${displayName} in one minute` : `How ${code} is performing`}</h2>
-                <p>{publicTab === "Overview" ? `${detail.city && detail.state ? `${detail.city}, ${detail.state}` : "Location unavailable"}. This page shows how flights moved through the airport in the BTS record.` : "These numbers are calculated from the BTS warehouse for this airport and the full available history."}</p>
+                <p>{publicTab === "Overview" ? `${detail.city && detail.state ? `${detail.city}, ${detail.state}` : `${displayName} is identified here by IATA code ${code}`}. This page shows how flights moved through the airport in the BTS record.` : "These numbers are calculated from the BTS warehouse for this airport and the full available history."}</p>
               </div>
 
             <div className="board">
