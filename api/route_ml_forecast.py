@@ -59,6 +59,13 @@ RIDGE_PENALTY = 1.0
 PANEL_TABLE = "analytics_route_month"
 PANEL_MIN_COMPLETED = 30
 PANEL_MIN_TRAINING_EXAMPLES = 120
+# The network has almost 10,000 directional routes.  The local research app
+# keeps its interactive global fit to a deterministic, route-only sample so a
+# single click does not need to materialize every raw T-100 segment again.
+# Route-specific history is always fetched separately for the route being
+# scored.  This is a performance boundary, not an outcome-based filter.
+PANEL_DEFAULT_TRAINING_ROUTE_SAMPLE = 900
+PANEL_MIN_ROUTE_MONTHS_FOR_SAMPLE = 24
 PANEL_FEATURE_NAMES = (
     "prior_late_rate",
     "prior_delay_minutes",
@@ -72,19 +79,41 @@ PANEL_FEATURE_NAMES = (
     "traffic_completion_rate",
     "traffic_context_available",
     "traffic_staleness_months",
+    "operational_weather_affected_rate",
+    "operational_weather_delay_minutes_per_departure",
+    "operational_nas_affected_rate",
+    "operational_nas_delay_minutes_per_departure",
+    "operational_avg_departure_delay_minutes",
+    "operational_peak_hour_departures_log",
+    "operational_peak_hour_share",
+    "operational_context_available",
+    "operational_staleness_months",
     "distance_log",
     "month_sin",
     "month_cos",
     "log_prior_completed_flights",
 )
-# The ablation deliberately removes every lagged T-100 input while keeping
-# the same OTP history, distance, seasonality, and sample-size inputs. This
-# lets the researcher answer whether T-100 adds predictive value, rather than
-# assuming that a richer feature set is automatically better.
-PANEL_NO_T100_FEATURE_INDICES = tuple(
-    index for index, name in enumerate(PANEL_FEATURE_NAMES) if not name.startswith("traffic_")
+# Feature groups are explicit so evidence pages can compare one information
+# source at a time.  All operational fields are lagged observed airport-month
+# conditions, never the target month's outcomes or a live weather forecast.
+PANEL_OTP_FEATURE_INDICES = tuple(
+    index
+    for index, name in enumerate(PANEL_FEATURE_NAMES)
+    if not name.startswith("traffic_") and not name.startswith("operational_")
 )
-PANEL_NO_T100_FEATURE_NAMES = tuple(PANEL_FEATURE_NAMES[index] for index in PANEL_NO_T100_FEATURE_INDICES)
+PANEL_T100_FEATURE_INDICES = tuple(
+    index for index, name in enumerate(PANEL_FEATURE_NAMES) if not name.startswith("operational_")
+)
+PANEL_FULL_FEATURE_INDICES = tuple(range(len(PANEL_FEATURE_NAMES)))
+PANEL_OTP_FEATURE_NAMES = tuple(PANEL_FEATURE_NAMES[index] for index in PANEL_OTP_FEATURE_INDICES)
+PANEL_T100_FEATURE_NAMES = tuple(PANEL_FEATURE_NAMES[index] for index in PANEL_T100_FEATURE_INDICES)
+
+# Kept as an import-compatible alias for the existing route-page API and
+# tests.  "Without T-100" here is intentionally the clean OTP-only baseline:
+# it also excludes operational additions, so the comparison isolates the
+# incremental source family rather than silently mixing two enhancements.
+PANEL_NO_T100_FEATURE_INDICES = PANEL_OTP_FEATURE_INDICES
+PANEL_NO_T100_FEATURE_NAMES = PANEL_OTP_FEATURE_NAMES
 PANEL_CACHE_TTL_SECONDS = 600
 _PANEL_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _PANEL_CACHE_LOCK = threading.Lock()
@@ -606,6 +635,34 @@ def _panel_outcomes(row: dict[str, Any]) -> tuple[float | None, float | None, fl
     )
 
 
+def _operational_feature_values(context_row: dict[str, Any], *, period: str) -> list[float]:
+    """Return lagged airport-operation inputs in the panel feature order.
+
+    ``operational_period`` is selected by an ASOF join with a strict
+    ``< prediction period`` condition.  Keeping the period in the row and
+    converting it to an explicit staleness field makes the information
+    boundary auditable in both the API response and model-evidence page.
+    """
+    target_index = _period_index(period)
+    operational_period = context_row.get("operational_period")
+    operational_staleness = (
+        max(target_index - _period_index(str(operational_period)), 0)
+        if operational_period
+        else 0
+    )
+    return [
+        float(context_row.get("operational_weather_affected_rate") or 0.0),
+        float(context_row.get("operational_weather_delay_minutes_per_departure") or 0.0),
+        float(context_row.get("operational_nas_affected_rate") or 0.0),
+        float(context_row.get("operational_nas_delay_minutes_per_departure") or 0.0),
+        float(context_row.get("operational_avg_departure_delay_minutes") or 0.0),
+        float(np.log1p(max(float(context_row.get("operational_peak_hour_departures") or 0.0), 0.0))),
+        float(context_row.get("operational_peak_hour_share") or 0.0),
+        1.0 if operational_period else 0.0,
+        float(operational_staleness),
+    ]
+
+
 def build_panel_feature_vector(
     prior_rows: list[dict[str, Any]],
     context_row: dict[str, Any],
@@ -660,6 +717,7 @@ def build_panel_feature_vector(
         float(context_row.get("traffic_completion_rate") or 0.0),
         1.0 if traffic_period else 0.0,
         float(traffic_staleness),
+        *_operational_feature_values(context_row, period=period),
         float(np.log1p(max(float(distance or 0.0), 0.0))),
         float(np.sin(angle)),
         float(np.cos(angle)),
@@ -727,6 +785,7 @@ def build_supervised_panel_examples(
                     float(row.get("traffic_completion_rate") or 0.0),
                     1.0 if traffic_period else 0.0,
                     float(traffic_staleness),
+                    *_operational_feature_values(row, period=str(row["period"])),
                     float(np.log1p(max(distance, 0.0))),
                     float(np.sin(angle)),
                     float(np.cos(angle)),
@@ -774,100 +833,217 @@ def _query_route_panel(
     connection: Any,
     *,
     target_period: str,
+    max_routes: int | None = None,
+    include_routes: tuple[tuple[str, str], ...] = (),
 ) -> list[dict[str, Any]]:
+    """Load a leakage-safe route panel, optionally from a route-only sample.
+
+    ``max_routes`` is deliberately applied before the T-100 and airport
+    context joins.  Without that boundary, an interactive request has to sort
+    and ASOF-join the entire multi-million-row T-100 source table.  Sampling
+    is deterministic from route IDs, never outcomes, and callers can include
+    a selected route explicitly.  Passing ``max_routes=0`` with
+    ``include_routes`` fetches only those routes.
+    """
     from api.analytics import table_exists
 
     if not table_exists(connection, PANEL_TABLE):
         return []
-    has_t100 = table_exists(connection, "bts_t100_segment_route_month")
-    if has_t100:
-        rows = connection.execute(
-            f"""
-            WITH traffic AS (
-                SELECT
-                    Origin AS origin,
-                    Dest AS dest,
-                    make_date(CAST(Year AS INTEGER), CAST(Month AS INTEGER), 1) AS period_date,
-                    SUM(COALESCE(seats_available, 0)) AS seats_available,
-                    SUM(COALESCE(passengers, 0)) AS passengers,
-                    SUM(COALESCE(departures_scheduled, 0)) AS departures_scheduled,
-                    SUM(COALESCE(departures_performed, 0)) AS departures_performed,
-                    SUM(COALESCE(passengers, 0)) / NULLIF(SUM(COALESCE(seats_available, 0)), 0) AS load_factor,
-                    SUM(COALESCE(departures_performed, 0)) / NULLIF(SUM(COALESCE(departures_scheduled, 0)), 0) AS completion_rate
-                FROM bts_t100_segment_route_month
-                GROUP BY Origin, Dest, Year, Month
-            ), route_panel AS (
-                SELECT
-                    origin,
-                    dest,
-                    year_month AS period,
-                    make_date(
-                        CAST(left(CAST(year_month AS VARCHAR), 4) AS INTEGER),
-                        CAST(right(CAST(year_month AS VARCHAR), 2) AS INTEGER),
-                        1
-                    ) AS period_date,
-                    total_flights,
-                    completed_flights,
-                    on_time_rate,
-                    avg_arrival_delay_minutes,
-                    cancellation_rate,
-                    distance_miles
-                FROM {PANEL_TABLE}
-                WHERE year_month < ?
-            )
-            SELECT
-                r.origin,
-                r.dest,
-                r.period,
-                r.total_flights,
-                r.completed_flights,
-                r.on_time_rate,
-                r.avg_arrival_delay_minutes,
-                r.cancellation_rate,
-                r.distance_miles,
-                strftime(t.period_date, '%Y-%m') AS traffic_period,
-                t.seats_available AS traffic_seats_available,
-                t.passengers AS traffic_passengers,
-                t.load_factor AS traffic_load_factor,
-                t.completion_rate AS traffic_completion_rate
-            FROM route_panel r
-            ASOF LEFT JOIN traffic t
-              ON r.origin = t.origin
-             AND r.dest = t.dest
-             AND t.period_date < r.period_date
-            ORDER BY r.origin, r.dest, r.period_date
-            """,
-            [target_period],
-        ).fetchall()
-    else:
-        rows = connection.execute(
-            f"""
+    has_compact_t100 = table_exists(connection, "analytics_t100_route_month")
+    has_raw_t100 = table_exists(connection, "bts_t100_segment_route_month")
+    has_t100 = has_compact_t100 or has_raw_t100
+    has_operational_drivers = table_exists(connection, "analytics_airport_operational_month")
+    route_ctes = [
+        f"""route_base AS (
             SELECT
                 origin,
                 dest,
                 year_month AS period,
+                make_date(
+                    CAST(left(CAST(year_month AS VARCHAR), 4) AS INTEGER),
+                    CAST(right(CAST(year_month AS VARCHAR), 2) AS INTEGER),
+                    1
+                ) AS period_date,
                 total_flights,
                 completed_flights,
                 on_time_rate,
                 avg_arrival_delay_minutes,
                 cancellation_rate,
-                distance_miles,
-                NULL AS traffic_period,
-                NULL AS traffic_seats_available,
-                NULL AS traffic_passengers,
-                NULL AS traffic_load_factor,
-                NULL AS traffic_completion_rate
+                distance_miles
             FROM {PANEL_TABLE}
             WHERE year_month < ?
-            ORDER BY origin, dest, year_month
-            """,
-            [target_period],
-        ).fetchall()
+        )"""
+    ]
+    params: list[Any] = [target_period]
+    if max_routes is None and not include_routes:
+        route_ctes.append("route_panel AS (SELECT * FROM route_base)")
+    else:
+        selection_sources: list[str] = []
+        if max_routes is not None and max_routes > 0:
+            route_ctes.append(
+                """sampled_routes AS (
+                    SELECT origin, dest
+                    FROM route_base
+                    GROUP BY origin, dest
+                    HAVING COUNT(*) >= ?
+                    ORDER BY hash(origin || '->' || dest)
+                    LIMIT ?
+                )"""
+            )
+            params.extend([PANEL_MIN_ROUTE_MONTHS_FOR_SAMPLE, int(max_routes)])
+            selection_sources.append("SELECT origin, dest FROM sampled_routes")
+        if include_routes:
+            included_predicates = " OR ".join("(origin = ? AND dest = ?)" for _ in include_routes)
+            route_ctes.append(
+                f"""included_routes AS (
+                    SELECT DISTINCT origin, dest
+                    FROM route_base
+                    WHERE {included_predicates}
+                )"""
+            )
+            for origin, dest in include_routes:
+                params.extend([origin.upper(), dest.upper()])
+            selection_sources.append("SELECT origin, dest FROM included_routes")
+        if not selection_sources:
+            raise ValueError("A sampled route-panel query needs a positive route limit or included route.")
+        route_ctes.extend([
+            "selected_routes AS (" + " UNION ".join(selection_sources) + ")",
+            """route_panel AS (
+                SELECT r.*
+                FROM route_base r
+                INNER JOIN selected_routes s ON r.origin = s.origin AND r.dest = s.dest
+            )""",
+        ])
+
+    ctes = list(route_ctes)
+    if has_compact_t100:
+        ctes.append("""traffic AS (
+            SELECT
+                t100.origin,
+                t100.dest,
+                t100.period_date,
+                t100.seats_available,
+                t100.passengers,
+                t100.departures_scheduled,
+                t100.departures_performed,
+                t100.load_factor,
+                t100.completion_rate
+            FROM analytics_t100_route_month t100
+            INNER JOIN (SELECT DISTINCT origin, dest FROM route_panel) sampled
+                ON t100.origin = sampled.origin AND t100.dest = sampled.dest
+        )""")
+    elif has_raw_t100:
+        # Compatibility fallback for a warehouse that has T-100 source rows
+        # but has not yet run the compact-table refresh.
+        ctes.append("""traffic AS (
+            SELECT
+                t100.Origin AS origin,
+                t100.Dest AS dest,
+                make_date(CAST(t100.Year AS INTEGER), CAST(t100.Month AS INTEGER), 1) AS period_date,
+                SUM(COALESCE(t100.seats_available, 0)) AS seats_available,
+                SUM(COALESCE(t100.passengers, 0)) AS passengers,
+                SUM(COALESCE(t100.departures_scheduled, 0)) AS departures_scheduled,
+                SUM(COALESCE(t100.departures_performed, 0)) AS departures_performed,
+                SUM(COALESCE(t100.passengers, 0)) / NULLIF(SUM(COALESCE(t100.seats_available, 0)), 0) AS load_factor,
+                SUM(COALESCE(t100.departures_performed, 0)) / NULLIF(SUM(COALESCE(t100.departures_scheduled, 0)), 0) AS completion_rate
+            FROM bts_t100_segment_route_month t100
+            INNER JOIN (SELECT DISTINCT origin, dest FROM route_panel) sampled
+                ON t100.Origin = sampled.origin AND t100.Dest = sampled.dest
+            GROUP BY t100.Origin, t100.Dest, t100.Year, t100.Month
+        )""")
+    if has_operational_drivers:
+        ctes.append("""operational AS (
+            SELECT
+                airport,
+                make_date(
+                    CAST(left(CAST(year_month AS VARCHAR), 4) AS INTEGER),
+                    CAST(right(CAST(year_month AS VARCHAR), 2) AS INTEGER),
+                    1
+                ) AS period_date,
+                weather_affected_rate,
+                weather_delay_minutes_per_departure,
+                nas_affected_rate,
+                nas_delay_minutes_per_departure,
+                avg_departure_delay_minutes,
+                peak_hour_departures,
+                peak_hour_share
+            FROM analytics_airport_operational_month
+            INNER JOIN (SELECT DISTINCT origin FROM route_panel) sampled
+                ON airport = sampled.origin
+        )""")
+
+    traffic_columns = """
+        strftime(t.period_date, '%Y-%m') AS traffic_period,
+        t.seats_available AS traffic_seats_available,
+        t.passengers AS traffic_passengers,
+        t.load_factor AS traffic_load_factor,
+        t.completion_rate AS traffic_completion_rate
+    """ if has_t100 else """
+        NULL AS traffic_period,
+        NULL AS traffic_seats_available,
+        NULL AS traffic_passengers,
+        NULL AS traffic_load_factor,
+        NULL AS traffic_completion_rate
+    """
+    operational_columns = """
+        strftime(o.period_date, '%Y-%m') AS operational_period,
+        o.weather_affected_rate AS operational_weather_affected_rate,
+        o.weather_delay_minutes_per_departure AS operational_weather_delay_minutes_per_departure,
+        o.nas_affected_rate AS operational_nas_affected_rate,
+        o.nas_delay_minutes_per_departure AS operational_nas_delay_minutes_per_departure,
+        o.avg_departure_delay_minutes AS operational_avg_departure_delay_minutes,
+        o.peak_hour_departures AS operational_peak_hour_departures,
+        o.peak_hour_share AS operational_peak_hour_share
+    """ if has_operational_drivers else """
+        NULL AS operational_period,
+        NULL AS operational_weather_affected_rate,
+        NULL AS operational_weather_delay_minutes_per_departure,
+        NULL AS operational_nas_affected_rate,
+        NULL AS operational_nas_delay_minutes_per_departure,
+        NULL AS operational_avg_departure_delay_minutes,
+        NULL AS operational_peak_hour_departures,
+        NULL AS operational_peak_hour_share
+    """
+    joins: list[str] = []
+    if has_t100:
+        joins.append("""ASOF LEFT JOIN traffic t
+          ON r.origin = t.origin
+         AND r.dest = t.dest
+         AND t.period_date < r.period_date""")
+    if has_operational_drivers:
+        joins.append("""ASOF LEFT JOIN operational o
+          ON r.origin = o.airport
+         AND o.period_date < r.period_date""")
+    rows = connection.execute(
+        f"""
+        WITH {', '.join(ctes)}
+        SELECT
+            r.origin,
+            r.dest,
+            r.period,
+            r.total_flights,
+            r.completed_flights,
+            r.on_time_rate,
+            r.avg_arrival_delay_minutes,
+            r.cancellation_rate,
+            r.distance_miles,
+            {traffic_columns},
+            {operational_columns}
+        FROM route_panel r
+        {' '.join(joins)}
+        ORDER BY r.origin, r.dest, r.period_date
+        """,
+        params,
+    ).fetchall()
     keys = (
         "origin", "dest", "period", "total_flights", "completed_flights",
         "on_time_rate", "avg_arrival_delay_minutes", "cancellation_rate", "distance_miles",
         "traffic_period", "traffic_seats_available", "traffic_passengers",
         "traffic_load_factor", "traffic_completion_rate",
+        "operational_period", "operational_weather_affected_rate",
+        "operational_weather_delay_minutes_per_departure", "operational_nas_affected_rate",
+        "operational_nas_delay_minutes_per_departure", "operational_avg_departure_delay_minutes",
+        "operational_peak_hour_departures", "operational_peak_hour_share",
     )
     return [dict(zip(keys, row)) for row in rows]
 
@@ -904,7 +1080,11 @@ def _load_or_train_panel(
         if cached is not None and now - cached[0] < PANEL_CACHE_TTL_SECONDS:
             return cached[1]
 
-    panel_rows = _query_route_panel(connection, target_period=target_period)
+    panel_rows = _query_route_panel(
+        connection,
+        target_period=target_period,
+        max_routes=PANEL_DEFAULT_TRAINING_ROUTE_SAMPLE,
+    )
     if not panel_rows:
         result = {"error": "The materialized route-month panel is unavailable or empty."}
     else:
@@ -925,35 +1105,58 @@ def _load_or_train_panel(
                     "examples": examples,
                 }
             else:
-                evaluation_fit = _fit_models(train)
-                test_predictions = _predict_models(evaluation_fit, test)
-                no_t100_fit = _fit_models(train, feature_indices=PANEL_NO_T100_FEATURE_INDICES)
-                no_t100_predictions = _predict_models(no_t100_fit, test)
-                with_t100_metrics = _metric_summary(test, test_predictions)
-                without_t100_metrics = _metric_summary(test, no_t100_predictions)
+                # Three nested models make the added evidence inspectable:
+                # historical OTP only; OTP plus lagged T-100; and the full
+                # model with lagged airport-operation context.  All use the
+                # exact same future holdout rows.
+                full_evaluation_fit = _fit_models(train, feature_indices=PANEL_FULL_FEATURE_INDICES)
+                full_test_metrics = _metric_summary(test, _predict_models(full_evaluation_fit, test))
+                t100_fit = _fit_models(train, feature_indices=PANEL_T100_FEATURE_INDICES)
+                t100_metrics = _metric_summary(test, _predict_models(t100_fit, test))
+                otp_fit = _fit_models(train, feature_indices=PANEL_OTP_FEATURE_INDICES)
+                otp_metrics = _metric_summary(test, _predict_models(otp_fit, test))
                 result = {
                     "panel_rows": panel_rows,
                     "examples": examples,
-                    "production_fit": _fit_models(examples),
+                    "production_fit": _fit_models(examples, feature_indices=PANEL_FULL_FEATURE_INDICES),
                     "split": split,
-                    "test_metrics": with_t100_metrics,
+                    "test_metrics": full_test_metrics,
                     "baseline_test_metrics": _metric_summary(test, _baseline_predictions(test)),
                     "t100_ablation": {
-                        "with_t100_test_metrics": with_t100_metrics,
-                        "without_t100_test_metrics": without_t100_metrics,
-                        "with_t100_features": list(PANEL_FEATURE_NAMES),
+                        "with_t100_test_metrics": t100_metrics,
+                        "without_t100_test_metrics": otp_metrics,
+                        "with_t100_features": list(PANEL_T100_FEATURE_NAMES),
                         "without_t100_features": list(PANEL_NO_T100_FEATURE_NAMES),
                         "improved_targets": [
                             target
                             for target in ("delay_minutes", "late_rate", "cancellation_rate")
-                            if with_t100_metrics.get(f"{target}_mae") is not None
-                            and without_t100_metrics.get(f"{target}_mae") is not None
-                            and with_t100_metrics[f"{target}_mae"] < without_t100_metrics[f"{target}_mae"]
+                            if t100_metrics.get(f"{target}_mae") is not None
+                            and otp_metrics.get(f"{target}_mae") is not None
+                            and t100_metrics[f"{target}_mae"] < otp_metrics[f"{target}_mae"]
                         ],
                         "note": (
                             "This is a held-out feature ablation: both models use the same chronological split, "
-                            "but the second model removes lagged T-100 traffic inputs. A lower error with T-100 "
+                            "but the OTP-only model removes lagged T-100 traffic inputs and airport-operation inputs. "
+                            "A lower error with T-100 "
                             "supports predictive usefulness in this snapshot; it does not establish causation."
+                        ),
+                    },
+                    "operational_driver_ablation": {
+                        "with_operational_drivers_test_metrics": full_test_metrics,
+                        "without_operational_drivers_test_metrics": t100_metrics,
+                        "with_operational_driver_features": list(PANEL_FEATURE_NAMES),
+                        "without_operational_driver_features": list(PANEL_T100_FEATURE_NAMES),
+                        "improved_targets": [
+                            target
+                            for target in ("delay_minutes", "late_rate", "cancellation_rate")
+                            if full_test_metrics.get(f"{target}_mae") is not None
+                            and t100_metrics.get(f"{target}_mae") is not None
+                            and full_test_metrics[f"{target}_mae"] < t100_metrics[f"{target}_mae"]
+                        ],
+                        "note": (
+                            "This second held-out comparison keeps lagged T-100 fixed and adds only prior "
+                            "airport weather/NAS/concentration signals. It measures prediction error, not "
+                            "whether those signals caused a later outcome."
                         ),
                     },
                 }
@@ -961,6 +1164,51 @@ def _load_or_train_panel(
     with _PANEL_CACHE_LOCK:
         _PANEL_CACHE[target_period] = (now, result)
     return result
+
+
+def _load_lagged_operational_context(
+    connection: Any,
+    *,
+    airport: str,
+    target_period: str,
+) -> dict[str, Any]:
+    """Fetch the latest observed airport context strictly before a target month."""
+    from api.analytics import table_exists
+
+    table = "analytics_airport_operational_month"
+    if not table_exists(connection, table):
+        return {}
+    row = connection.execute(
+        f"""
+        SELECT
+            year_month,
+            weather_affected_rate,
+            weather_delay_minutes_per_departure,
+            nas_affected_rate,
+            nas_delay_minutes_per_departure,
+            avg_departure_delay_minutes,
+            peak_hour_departures,
+            peak_hour_share
+        FROM {table}
+        WHERE airport = ? AND year_month < ?
+        ORDER BY year_month DESC
+        LIMIT 1
+        """,
+        [airport, target_period],
+    ).fetchone()
+    if row is None:
+        return {}
+    keys = (
+        "operational_period",
+        "operational_weather_affected_rate",
+        "operational_weather_delay_minutes_per_departure",
+        "operational_nas_affected_rate",
+        "operational_nas_delay_minutes_per_departure",
+        "operational_avg_departure_delay_minutes",
+        "operational_peak_hour_departures",
+        "operational_peak_hour_share",
+    )
+    return dict(zip(keys, row))
 
 
 def build_route_panel_ml_forecast(
@@ -988,12 +1236,13 @@ def build_route_panel_ml_forecast(
     target_period = target_start.strftime("%Y-%m")
 
     panel = _load_or_train_panel(connection, target_period=target_period)
-    panel_rows = panel.get("panel_rows", [])
     examples = panel.get("examples", [])
-    route_rows = [
-        row for row in panel_rows
-        if str(row["origin"]).upper() == origin and str(row["dest"]).upper() == dest
-    ]
+    route_rows = _query_route_panel(
+        connection,
+        target_period=target_period,
+        max_routes=0,
+        include_routes=((origin, dest),),
+    )
     if not route_rows:
         raise LookupError(f"No route-month history for {origin} → {dest} before {target_period}.")
     if "error" in panel or len(examples) < PANEL_MIN_TRAINING_EXAMPLES:
@@ -1030,6 +1279,15 @@ def build_route_panel_ml_forecast(
             "traffic_load_factor": latest_traffic["load_factor"],
             "traffic_completion_rate": latest_traffic["completion_rate"],
         })
+    # Unlike a row already present in the route panel, the requested target
+    # month may be one month beyond the latest observed route. Fetch the
+    # latest airport context again with a strict temporal boundary so the
+    # target sees the most recent *prior* operational month, never itself.
+    target_context.update(_load_lagged_operational_context(
+        connection,
+        airport=origin,
+        target_period=target_period,
+    ))
     target_features = build_panel_feature_vector(route_rows, target_context, period=target_period)
     target_values = production_fit["standardizer"].transform(np.asarray([target_features], dtype=float))
     predictions = {
@@ -1063,6 +1321,7 @@ def build_route_panel_ml_forecast(
         "test_metrics": test_metrics,
         "baseline_test_metrics": baseline_test_metrics,
         "t100_ablation": panel.get("t100_ablation"),
+        "operational_driver_ablation": panel.get("operational_driver_ablation"),
         "model_selection": {
             "improved_targets": [
                 target for target in ("delay_minutes", "late_rate", "cancellation_rate")

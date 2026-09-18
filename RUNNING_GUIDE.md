@@ -227,6 +227,23 @@ The update process records its state and does not invent an unpublished month.
 The latest date shown by the app therefore depends on BTS publication, not on a
 hard-coded promise in the UI.
 
+### Monthly coordinated refresh
+
+For normal maintenance, prefer the single sequence below instead of manually
+remembering which source to run next:
+
+~~~
+python -m pipeline.refresh_all
+~~~
+
+It checks OTP, checks T-100 Segment and Market, then rebuilds the compact
+analytics tables once, including the all-carrier `analytics_t100_route_month`
+model table. The local-only outcome is written to
+`Data/refresh_state.json`. It is normal for the result to say that a future
+month is not published yet; that is different from a failed refresh. Use
+`python -m pipeline.refresh_all --help` for `--skip-otp`, `--skip-t100`, and
+`--materialize-only`.
+
 ## 8. Start the application
 
 The project uses backend port 8200 and frontend port 3100. Keep these ports
@@ -327,11 +344,24 @@ Check these in order:
 5. The Research workspace opens from the top-right switch.
 6. A researcher page can load data and does not show “data service could not
    be reached.”
-7. The warehouse readiness check reports a real file and a non-zero row count:
+7. In Research → Reference → Model evidence, run the repeated check once. It
+   should either show rolling windows or clearly explain that the warehouse is
+   too short for that test.
+8. The warehouse readiness check reports a real file and a non-zero row count:
 
 ~~~
 python scripts/check_deployment_readiness.py
 ~~~
+
+For a source-only clone before building a local warehouse, also run:
+
+~~~
+python scripts/verify_clean_clone.py
+~~~
+
+That command deliberately expects the large warehouse to be absent. It checks
+that the portable code, commands, and dependency manifests are present and that
+no local BTS data file was accidentally committed.
 
 ## 10. Stop the application
 

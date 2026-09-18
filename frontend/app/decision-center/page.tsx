@@ -137,6 +137,9 @@ export default function DecisionCenterPage() {
   const [bankMode, setBankMode] = useState<"expected" | "risk_averse">("expected");
   const [bankSeasonalYears, setBankSeasonalYears] = useState(3);
   const [bankResult, setBankResult] = useState<any>(null);
+  const [bankValidation, setBankValidation] = useState<any>(null);
+  const [bankValidationLoading, setBankValidationLoading] = useState(false);
+  const [bankValidationError, setBankValidationError] = useState("");
 
   const [portfolioType, setPortfolioType] = useState<"carrier" | "airport">("carrier");
   const [portfolioBudgetInput, setPortfolioBudgetInput] = useState(3);
@@ -165,6 +168,8 @@ export default function DecisionCenterPage() {
     setRiskResult(null);
     setRiskMethod("math");
     setBankResult(null);
+    setBankValidation(null);
+    setBankValidationError("");
     setPortfolioResult(null);
     setResilienceResult(null);
     setCapacityResult(null);
@@ -200,6 +205,8 @@ export default function DecisionCenterPage() {
         if (!res.ok) throw new Error("not ok");
         setRiskResult(await res.json());
       } else if (tab === "bank") {
+        setBankValidation(null);
+        setBankValidationError("");
         const params = new URLSearchParams({
           airport: bankAirport,
           window_start_hour: String(bankWindowStart), window_end_hour: String(bankWindowEnd),
@@ -243,6 +250,36 @@ export default function DecisionCenterPage() {
   }
 
   const topLever = leverResult?.levers?.[0];
+
+  async function validateBankHistory() {
+    if (!bankResult) return;
+    setBankValidationLoading(true);
+    setBankValidationError("");
+    try {
+      const [startDate, endDate] = String(bankResult.date_range).split(" to ");
+      const params = new URLSearchParams({
+        airport: bankResult.airport,
+        start_date: startDate,
+        end_date: endDate,
+        window_start_hour: String(bankWindowStart),
+        window_end_hour: String(bankWindowEnd),
+        allowed_shift_minutes: String(bankShift),
+        maximum_windows: "3",
+        reference_lookback_years: String(Math.max(bankSeasonalYears, 1)),
+      });
+      if (bankCarrier) params.set("carrier", bankCarrier);
+      if (bankMaxMoved !== null) params.set("max_moved_flights", String(bankMaxMoved));
+      const response = await fetch(`${API_BASE}/api/decision/departure-bank-validation?${params}`);
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail ?? "The historical stability check could not run.");
+      setBankValidation(payload);
+    } catch (cause) {
+      setBankValidation(null);
+      setBankValidationError(cause instanceof Error ? cause.message : "The historical stability check could not run.");
+    } finally {
+      setBankValidationLoading(false);
+    }
+  }
 
   function scenarioCell(turnaround: string, predecessor: string): ScenarioCell | undefined {
     return scenarioResult?.cells.find(
@@ -1064,6 +1101,37 @@ export default function DecisionCenterPage() {
               <span className="decision-verdict-label">How the comparison works</span>
               <span> The tool compares this busy period with similar past periods and balances a smaller peak against how far flights have to move.</span>
             </div>
+
+            <div className="bank-validation-panel">
+              <div>
+                <p className="eyebrow">Historical stability check</p>
+                <strong>Does this simulated peak reduction repeat in prior equivalent windows?</strong>
+                <p className="page-note">This replays the same bounded optimizer in three earlier calendar windows. Each replay uses only still-earlier years to set its baseline; it checks schedule-model stability, not the causal effect of a real intervention.</p>
+              </div>
+              <button type="button" className="secondary-action" onClick={() => void validateBankHistory()} disabled={bankValidationLoading}>
+                {bankValidationLoading ? "Checking prior years…" : "Check prior years"}
+              </button>
+            </div>
+            {bankValidationError && <p className="page-note" style={{ color: "#ffc3bd" }}>{bankValidationError}</p>}
+            {bankValidation && (
+              <div className="bank-validation-results">
+                {bankValidation.status === "ready" ? (
+                  <>
+                    <div className="board board-compact">
+                      <Tile label="Past windows checked" value={`${bankValidation.summary.windows_evaluated} of ${bankValidation.summary.windows_requested}`} />
+                      <Tile label="Windows with smaller peak" value={String(bankValidation.summary.windows_with_smaller_simulated_peak)} />
+                      <Tile label="Median peak reduction" value={bankValidation.summary.median_peak_reduction == null ? "—" : `${bankValidation.summary.median_peak_reduction} flights`} />
+                      <Tile label="Average movement" value={bankValidation.summary.average_movement_minutes == null ? "—" : `${bankValidation.summary.average_movement_minutes} min`} />
+                    </div>
+                    <table className="compare-table">
+                      <thead><tr><th>Past test window</th><th>Reference years</th><th>Peak before</th><th>Peak after</th><th>Difference</th></tr></thead>
+                      <tbody>{bankValidation.records.map((record: any) => <tr key={record.test_window}><td>{record.test_window}</td><td>{record.reference_years_used}</td><td>{record.original_peak_load}</td><td>{record.optimized_peak_load}</td><td>{record.peak_reduction > 0 ? `-${record.peak_reduction}` : record.peak_reduction}</td></tr>)}</tbody>
+                    </table>
+                    <p className="page-note" style={{ marginTop: "0.75rem" }}>{bankValidation.methodology.not_claimed}</p>
+                  </>
+                ) : <p className="page-note">{bankValidation.methodology?.not_claimed ?? "There was not enough prior history for this stability check."}</p>}
+              </div>
+            )}
 
             <div style={{ marginTop: "1.5rem" }}>
               <p className="eyebrow" style={{ marginBottom: "0.75rem" }}>Flights in each 15-minute period, before and after</p>

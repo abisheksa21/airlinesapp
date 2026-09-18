@@ -78,12 +78,12 @@ app.
 ### Step 4 — Materialize the dashboard analytics layer
 
 The raw `flights` table is always the source of truth. After a full build, the
-pipeline creates one explicit compact flight projection and five compact,
+pipeline creates one explicit compact flight projection and compact,
 deterministic aggregate tables for the pages that are visited most often:
-network-month, carrier-month, route-month, airport-month, and route + carrier +
-departure-hour. The projection keeps only fields needed by the dashboard and
+network-month, carrier-month, route-month, airport-month, airport operational
+context, and route + carrier + departure-hour. The projection keeps only fields needed by the dashboard and
 future forecasting work; the aggregates contain derived counts and rates, not
-fabricated observations. All six are rebuilt automatically by
+fabricated observations. The OTP tables are rebuilt automatically by
 `pipeline.build_warehouse` and refreshed by `pipeline.auto_update`. See
 [`OTP_CORE_SCHEMA.md`](OTP_CORE_SCHEMA.md) for the field contract.
 
@@ -110,6 +110,9 @@ time-aware Carrier Decode, Master Coordinate, and AircraftTypes support tables.
 These are kept in separate native-grain tables so monthly aggregate traffic is
 never duplicated across individual flights. See [DATA_SOURCES.md](DATA_SOURCES.md)
 for the verified source mapping, commands, validation rules, and limitations.
+The refresh also builds `analytics_t100_route_month`, a compact all-carrier
+directional route-month table for the model layer; the native T-100 source
+tables remain unchanged.
 
 For a small first run:
 
@@ -145,6 +148,15 @@ The researcher Routes comparison also runs a T-100 ablation: the same
 chronological ML test is repeated with lagged T-100 features removed. This
 shows whether the extra source lowers held-out error for any outcome instead of
 assuming that more features are automatically better.
+The researcher-only **Model evidence** page extends this to repeated rolling
+future-month windows. It compares OTP history, OTP + lagged T-100, and — when
+the compact airport operation table is available — OTP + T-100 + lagged
+WeatherDelay/NASDelay/departure-concentration context. The final source is
+strictly historical airport context, not live weather, official capacity, or a
+causal claim. To keep the interactive repeated check practical on a local
+machine, it evaluates a disclosed deterministic sample of 200 route IDs (not
+chosen using performance outcomes) from the available network. The individual
+route pages and the warehouse retain the full history.
 Route-month capacity context is available through `/api/capacity/summary`, a grain-matched T-100 vs.
 on-time comparison through `/api/capacity/correlation`, and a simple monthly
 trend through `/api/capacity/trend`. The Researcher view has both a dedicated
@@ -155,6 +167,33 @@ table when a verified BTS ZIP is available, and never fabricates an unpublished
 month.
 Before the enrichment tables are loaded, those endpoints report that state
 explicitly; they do not substitute fabricated values.
+
+### Monthly refresh and portable-source checks
+
+Once the warehouse exists, the normal monthly maintenance command is:
+
+```bash
+python -m pipeline.refresh_all
+```
+
+It checks new OTP files, checks T-100 Segment and Market, then rebuilds all
+compact tables once. The machine-local result is recorded in
+`Data/refresh_state.json`. Use `--skip-otp`, `--skip-t100`, or
+`--materialize-only` when needed; see `python -m pipeline.refresh_all --help`.
+
+A repository clone intentionally has no warehouse. Verify that a newly cloned
+source tree contains everything portable — and no accidentally committed BTS
+data — with:
+
+```bash
+python scripts/verify_clean_clone.py
+```
+
+To also check an existing external warehouse without copying it into Git:
+
+```bash
+python scripts/verify_clean_clone.py --warehouse /path/to/airline.duckdb
+```
 
 ### Verifying it worked
 

@@ -36,6 +36,7 @@ const RESEARCH_GROUPS = [
     label: "Reference",
     links: [
       { href: "/data-health", label: "Data health" },
+      { href: "/model-evidence", label: "Model evidence" },
       { href: "/methodology", label: "Methodology" },
       { href: "/copilot", label: "Copilot" },
     ],

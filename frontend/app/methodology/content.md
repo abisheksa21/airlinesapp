@@ -381,6 +381,13 @@ gate constraints. Its result means “this historical bank can be mathematically
 spread under these stated assumptions,” not “this is an executable airline
 schedule.”
 
+The optional **Check prior years** control replays the same experiment in
+earlier equivalent calendar windows. For a past test window, its preferred bank
+limit and delay proxy are built from still-earlier equivalent years only. This
+is a stability check: it asks whether the MILP repeatedly creates a smaller
+*simulated* 15-minute peak under the same constraints. It is not an observed
+before/after intervention study and cannot estimate a causal delay reduction.
+
 ## Network Protection Portfolio
 
 This is a small resource-allocation optimizer. Each candidate carrier or
@@ -592,9 +599,12 @@ The researcher Routes page can also run `/api/route-panel-forecast`. This model
 learns from many route-month histories in the materialized `analytics_route_month`
 table and then scores the selected route. Its panel features are prior route
 late rate, prior delay, prior cancellation rate, recent movement, lagged T-100
-load factor/passenger/seat context, distance, and calendar seasonality. T-100
-is joined as-of each OTP month, so the model only sees the latest traffic
-record that was available before that month. It currently does not use the
+load factor/passenger/seat context, lagged origin-airport operational context,
+distance, and calendar seasonality. The operational context contains historical
+WeatherDelay and NASDelay exposure, average departure delay, and how much of
+the airport's scheduled month was concentrated in its busiest clock hour.
+T-100 and operations are joined as-of each OTP month, so the model only sees
+the latest record that was available before that month. It currently does not use the
 selected airline or departure hour; the interface says so explicitly instead
 of implying a more specific forecast than the data supports.
 
@@ -620,6 +630,44 @@ traffic variables add predictive information in this dataset and time window;
 it does not prove that fuller flights cause delays. The Routes Comparison tab
 shows this result beside the ordinary Math-versus-ML comparison so the extra
 dataset remains auditable.
+
+## Repeated temporal validation
+
+The **Model evidence** page does not choose a single favorable train/test
+split. It creates several rolling checks. For each check, it trains only on
+route-month examples before a cutoff, then measures error on the following
+months. The next cutoff moves forward and repeats the same rule.
+
+```text
+earlier history  → fit model → later untouched months → record error
+move cutoff      → fit again  → next untouched months  → record error
+```
+
+Three nested candidates are compared whenever the matching source history is
+available:
+
+```text
+historical baseline        = the route's earlier OTP history
+OTP-only ML                = OTP history + distance + seasonality
+OTP + lagged T-100         = OTP-only ML + prior seats/passengers/load/completion
+OTP + T-100 + operations   = above + prior WeatherDelay/NASDelay/airport concentration
+```
+
+The page shows every time window, the average MAE across them, coverage for
+each added source, and how often a method has the lowest error. It does not
+hide a window that makes a richer model look worse. Lower MAE supports
+predictive usefulness; it does not show that traffic, weather, NAS, or
+concentration caused a later delay or cancellation.
+
+For an interactive local run, the repeated check uses a disclosed deterministic
+sample of 200 route identifiers from the available network. The sample is not
+chosen using delay, cancellation, or model outcome values. This keeps a laptop
+run responsive while preserving multiple routes and multiple future windows;
+the page states both the sampled and available network route counts.
+
+The operational fields are delayed by at least one calendar month. They are
+observed BTS delay coding, not a live weather feed, an air-traffic-control
+forecast, or a certified airport capacity estimate.
 
 ## Supporting queue-pressure model
 

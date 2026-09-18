@@ -3639,3 +3639,49 @@ html[data-site-mode="researcher"] .capacity-reading-guide p {
   .forecast-method-tab { min-height: auto; }
   .method-run-card .compare-run { width: 100%; }
 }
+
+/* ---- repeated model-evidence workspace ---- */
+.model-evidence-page { padding-bottom: 4rem; }
+.model-evidence-hero { display: flex; align-items: flex-end; justify-content: space-between; gap: 2rem; }
+.model-evidence-hero > div:first-child { max-width: 980px; }
+.model-evidence-intro { display: grid; grid-template-columns: minmax(250px, 0.9fr) minmax(0, 1.1fr); gap: 2rem; align-items: end; margin: 0 0 1.65rem; padding: 1.25rem 0; border-top: 1px solid var(--seam); border-bottom: 1px solid var(--seam); }
+.model-evidence-intro h2 { max-width: 620px; margin: 0.25rem 0 0; color: var(--flap); font-size: clamp(1.4rem, 2.8vw, 2.2rem); line-height: 1.08; letter-spacing: -0.04em; }
+.model-evidence-intro > p { max-width: 720px; margin: 0; color: var(--flap-dim); line-height: 1.65; }
+.model-evidence-run-panel { display: flex; align-items: center; justify-content: space-between; gap: 1.5rem; margin-bottom: 1.8rem; padding: 1.15rem 1.25rem; }
+.model-evidence-run-panel .section-title { margin: 0.25rem 0 0.35rem; }
+.model-evidence-run-panel .page-note { max-width: 760px; margin: 0; }
+.model-evidence-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+.model-evidence-actions .compare-run, .model-evidence-actions .secondary-action { min-height: 2.65rem; margin: 0; }
+.model-evidence-loading { display: flex; align-items: flex-start; gap: 0.75rem; margin-bottom: 1.2rem; padding: 1rem 1.15rem; }
+.model-evidence-loading .status-chip-dot { flex: 0 0 auto; margin-top: 0.3rem; }
+.model-evidence-loading strong { color: var(--flap); font-size: 0.86rem; }
+.model-evidence-loading p { margin: 0.25rem 0 0; color: var(--flap-dim); font-size: 0.76rem; }
+.model-evidence-board { margin-bottom: 0.65rem; }
+.model-evidence-scope-strip { display: flex; flex-wrap: wrap; gap: 0.55rem 1.5rem; padding: 0.75rem 0.9rem; border-left: 2px solid rgba(94, 234, 212, 0.62); color: var(--flap-dim); background: rgba(85, 230, 176, 0.045); font: 0.67rem/1.5 var(--font-mono), monospace; }
+.model-evidence-table, .model-evidence-window-table { min-width: 780px; }
+.model-evidence-table td, .model-evidence-window-table td { font-family: var(--font-mono), monospace; }
+.model-evidence-winner-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.7rem; margin-top: 0.85rem; }
+.model-evidence-winner-grid > div { min-height: 105px; padding: 0.85rem 0.9rem; border: 1px solid rgba(167, 139, 250, 0.22); border-top: 2px solid rgba(167, 139, 250, 0.78); border-radius: 9px; background: rgba(16, 24, 43, 0.68); }
+.model-evidence-winner-grid span, .model-evidence-winner-grid small { display: block; color: var(--flap-dim); font: 0.62rem var(--font-mono), monospace; letter-spacing: 0.08em; text-transform: uppercase; }
+.model-evidence-winner-grid strong { display: block; margin: 0.65rem 0 0.45rem; color: var(--flap); font-size: 0.88rem; line-height: 1.25; }
+.model-evidence-winner-grid small { color: #a78bfa; font-size: 0.57rem; }
+.model-evidence-reading-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.8rem; margin-top: 0.15rem; }
+.model-evidence-reading-grid .mini-method-card { min-height: 190px; }
+.bank-validation-panel { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-top: 1rem; padding: 0.95rem 1rem; border: 1px solid rgba(94, 234, 212, 0.22); border-radius: 10px; background: rgba(85, 230, 176, 0.045); }
+.bank-validation-panel strong { display: block; margin-top: 0.25rem; color: var(--flap); font-size: 0.92rem; }
+.bank-validation-panel .page-note { max-width: 850px; margin: 0.4rem 0 0; }
+.bank-validation-panel .secondary-action { flex: 0 0 auto; min-height: 2.5rem; }
+.bank-validation-results { margin-top: 0.85rem; padding: 0.9rem; border: 1px solid rgba(120, 145, 177, 0.22); border-radius: 10px; background: rgba(7, 15, 29, 0.46); overflow-x: auto; }
+.bank-validation-results .board { margin-bottom: 0.85rem; }
+
+@media (max-width: 900px) {
+  .model-evidence-hero, .model-evidence-run-panel { align-items: flex-start; flex-direction: column; }
+  .model-evidence-intro { grid-template-columns: 1fr; gap: 0.7rem; }
+  .model-evidence-winner-grid, .model-evidence-reading-grid { grid-template-columns: 1fr; }
+  .bank-validation-panel { align-items: flex-start; flex-direction: column; }
+}
+
+@media (max-width: 640px) {
+  .model-evidence-actions { width: 100%; }
+  .model-evidence-actions .compare-run, .model-evidence-actions .secondary-action { width: 100%; }
+}

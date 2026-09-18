@@ -22,6 +22,10 @@ The T-100 route-month views are derived aggregates, not new observations:
   `completion_rate = departures_performed / departures_scheduled`.
 - `bts_t100_market_route_month` aggregates market rows by carrier, route, and
   month.
+- `analytics_t100_route_month` is the compact, all-carrier directional
+  route-month representation used by the panel models. It is rebuilt from the
+  Segment route-month source during the normal refresh; it is a performance
+  layer, not a separate dataset or a new observation.
 
 These views are intentionally not joined one-to-many onto `flights`. A
 monthly T-100 passenger or seat value must not be copied onto every flight in
@@ -34,6 +38,15 @@ carrier/route/month grain, then joins it to
 and Pearson correlations between load factor, passengers, seats, and on-time
 rate through `/api/capacity/correlation`. The result is exploratory association,
 not a causal claim.
+
+The compact OTP layer also builds `analytics_airport_operational_month` at
+origin-airport + month grain. It summarizes four existing OTP concepts:
+WeatherDelay-coded exposure, NASDelay-coded exposure, average departure delay,
+and the share of scheduled departures concentrated in the busiest clock hour.
+This is a derived historical context table, not a separate source. The model
+evidence workflow uses it only from a month before the outcome being predicted.
+It must not be described as live weather, an FAA constraint feed, or certified
+airport capacity.
 
 ## Reproducible commands
 

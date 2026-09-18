@@ -22,7 +22,9 @@ ANALYTICS_TABLES = (
     "analytics_network_month",
     "analytics_carrier_month",
     "analytics_route_month",
+    "analytics_t100_route_month",
     "analytics_airport_month",
+    "analytics_airport_operational_month",
     "analytics_carrier_profile",
     "analytics_airport_profile",
     "analytics_airport_profile_month",
@@ -154,6 +156,59 @@ def build_profile_summary_tables(connection: Any) -> dict[str, int]:
     }
 
 
+def build_t100_route_month_table(connection: Any) -> int:
+    """Materialize the T-100 data at the route-month grain used by models.
+
+    The BTS T-100 source has carrier/detail rows.  Research pages compare it
+    beside OTP at a route + month grain, so aggregating it once during refresh
+    prevents every interactive request from re-reading millions of source
+    records.  If a warehouse has not loaded T-100 yet, we retain an empty,
+    typed table so the application can degrade gracefully to OTP-only views.
+    """
+    source_exists = connection.execute(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
+        ["bts_t100_segment_route_month"],
+    ).fetchone()[0]
+    if not source_exists:
+        connection.execute(
+            """
+            CREATE OR REPLACE TABLE analytics_t100_route_month AS
+            SELECT
+                CAST(NULL AS VARCHAR) AS origin,
+                CAST(NULL AS VARCHAR) AS dest,
+                CAST(NULL AS DATE) AS period_date,
+                CAST(NULL AS BIGINT) AS seats_available,
+                CAST(NULL AS BIGINT) AS passengers,
+                CAST(NULL AS BIGINT) AS departures_scheduled,
+                CAST(NULL AS BIGINT) AS departures_performed,
+                CAST(NULL AS DOUBLE) AS load_factor,
+                CAST(NULL AS DOUBLE) AS completion_rate
+            WHERE FALSE
+            """
+        )
+    else:
+        connection.execute(
+            """
+            CREATE OR REPLACE TABLE analytics_t100_route_month AS
+            SELECT
+                Origin AS origin,
+                Dest AS dest,
+                make_date(CAST(Year AS INTEGER), CAST(Month AS INTEGER), 1) AS period_date,
+                SUM(COALESCE(seats_available, 0)) AS seats_available,
+                SUM(COALESCE(passengers, 0)) AS passengers,
+                SUM(COALESCE(departures_scheduled, 0)) AS departures_scheduled,
+                SUM(COALESCE(departures_performed, 0)) AS departures_performed,
+                SUM(COALESCE(passengers, 0)) / NULLIF(SUM(COALESCE(seats_available, 0)), 0) AS load_factor,
+                SUM(COALESCE(departures_performed, 0)) / NULLIF(SUM(COALESCE(departures_scheduled, 0)), 0) AS completion_rate
+            FROM bts_t100_segment_route_month
+            WHERE Origin IS NOT NULL AND Dest IS NOT NULL AND Year IS NOT NULL AND Month IS NOT NULL
+            GROUP BY Origin, Dest, Year, Month
+            ORDER BY origin, dest, period_date
+            """
+        )
+    return int(connection.execute("SELECT COUNT(*) FROM analytics_t100_route_month").fetchone()[0])
+
+
 def build_analytics_tables(connection: Any) -> dict[str, int]:
     """Replace all dashboard aggregate tables and return their row counts."""
     core_count = build_otp_core_table(connection)
@@ -238,6 +293,79 @@ def build_analytics_tables(connection: Any) -> dict[str, int]:
             GROUP BY airport, year_month
             ORDER BY airport, year_month
         """,
+        # This is deliberately an *origin airport + month* operational
+        # context table.  It makes three observed BTS signals available at a
+        # compact grain: weather-coded delay exposure, NAS-coded delay
+        # exposure, and how concentrated scheduled departures were in the
+        # airport's busiest clock hour.  It is not a live weather feed, an
+        # FAA capacity declaration, or a causal attribution table.
+        "analytics_airport_operational_month": """
+            CREATE OR REPLACE TABLE analytics_airport_operational_month AS
+            WITH airport_month AS (
+                SELECT
+                    Origin AS airport,
+                    strftime(FlightDate, '%Y-%m') AS year_month,
+                    COUNT(*) AS total_departures,
+                    COUNT(*) FILTER (
+                        WHERE Cancelled = 0 AND DepDelay IS NOT NULL
+                    ) AS completed_departures,
+                    AVG(CASE
+                        WHEN Cancelled = 0 AND DepDelay IS NOT NULL THEN DepDelay
+                    END) AS avg_departure_delay_minutes,
+                    AVG(CASE
+                        WHEN COALESCE(WeatherDelay, 0) > 0 THEN 1.0 ELSE 0.0
+                    END) AS weather_affected_rate,
+                    SUM(COALESCE(WeatherDelay, 0)) / NULLIF(COUNT(*), 0)
+                        AS weather_delay_minutes_per_departure,
+                    AVG(CASE
+                        WHEN COALESCE(NASDelay, 0) > 0 THEN 1.0 ELSE 0.0
+                    END) AS nas_affected_rate,
+                    SUM(COALESCE(NASDelay, 0)) / NULLIF(COUNT(*), 0)
+                        AS nas_delay_minutes_per_departure
+                FROM analytics_flight_core
+                WHERE FlightDate IS NOT NULL AND Origin IS NOT NULL
+                GROUP BY airport, year_month
+            ), airport_hour AS (
+                SELECT
+                    Origin AS airport,
+                    strftime(FlightDate, '%Y-%m') AS year_month,
+                    CAST(FLOOR(CRSDepTime / 100) AS INTEGER) AS scheduled_hour,
+                    COUNT(*) AS scheduled_departures
+                FROM analytics_flight_core
+                WHERE FlightDate IS NOT NULL
+                  AND Origin IS NOT NULL
+                  AND CRSDepTime IS NOT NULL
+                  AND CAST(FLOOR(CRSDepTime / 100) AS INTEGER) BETWEEN 0 AND 23
+                GROUP BY airport, year_month, scheduled_hour
+            ), airport_peak AS (
+                SELECT
+                    airport,
+                    year_month,
+                    MAX(scheduled_departures) AS peak_hour_departures,
+                    COUNT(*) AS active_scheduled_hours
+                FROM airport_hour
+                GROUP BY airport, year_month
+            )
+            SELECT
+                month.airport,
+                month.year_month,
+                month.total_departures,
+                month.completed_departures,
+                month.avg_departure_delay_minutes,
+                month.weather_affected_rate,
+                month.weather_delay_minutes_per_departure,
+                month.nas_affected_rate,
+                month.nas_delay_minutes_per_departure,
+                COALESCE(peak.peak_hour_departures, 0) AS peak_hour_departures,
+                COALESCE(peak.peak_hour_departures, 0) / NULLIF(month.total_departures, 0)
+                    AS peak_hour_share,
+                COALESCE(peak.active_scheduled_hours, 0) AS active_scheduled_hours
+            FROM airport_month AS month
+            LEFT JOIN airport_peak AS peak
+              ON month.airport = peak.airport
+             AND month.year_month = peak.year_month
+            ORDER BY month.airport, month.year_month
+        """,
         "analytics_route_hour": """
             CREATE OR REPLACE TABLE analytics_route_hour AS
             SELECT
@@ -262,6 +390,9 @@ def build_analytics_tables(connection: Any) -> dict[str, int]:
     counts: dict[str, int] = {CORE_TABLE_NAME: core_count}
     for table_name in ANALYTICS_TABLES:
         if table_name == CORE_TABLE_NAME or table_name in PROFILE_TABLES:
+            continue
+        if table_name == "analytics_t100_route_month":
+            counts[table_name] = build_t100_route_month_table(connection)
             continue
         connection.execute(statements[table_name])
         counts[table_name] = int(connection.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])

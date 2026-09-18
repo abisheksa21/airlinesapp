@@ -35,6 +35,7 @@ from api.analytics import (
 )
 from api.route_forecast import build_route_forecast
 from api.route_ml_forecast import build_route_ml_forecast, build_route_panel_ml_forecast
+from api.model_evidence import build_route_panel_temporal_evidence
 from api import predictive_risk
 from api.health_score import compute_health_score, score_from_row, RAW_STAT_SELECT_EXPRS
 from api.delay_propagation_markov import get_delay_propagation_markov, STATES as MARKOV_STATES
@@ -43,6 +44,7 @@ from api.queue_pressure import get_queue_pressure
 from api.schedule_padding_trend import get_schedule_padding_trend
 from api.optimization.backend import PublicBackend
 from api.optimization.departure_bank import BankFlight, solve_departure_bank
+from api.optimization.departure_bank_validation import validate_departure_bank_history
 from api.optimization.network_protection import InterventionCandidate, solve_portfolio
 from api.schemas import ChatRequest
 from api.security import require_pipeline_admin
@@ -794,6 +796,54 @@ def departure_bank_smoothing_endpoint(
         ],
         "methodology": result.methodology,
     }
+
+
+@app.get("/api/decision/departure-bank-validation")
+def departure_bank_validation_endpoint(
+    airport: str = Query(...),
+    carrier: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None, description="Defaults to the most recent 90 days of available data."),
+    end_date: Optional[str] = Query(None),
+    window_start_hour: int = Query(6, ge=0, le=23),
+    window_end_hour: int = Query(10, ge=0, le=23),
+    allowed_shift_minutes: int = Query(30, ge=0, le=180),
+    maximum_windows: int = Query(3, ge=1, le=5),
+    reference_lookback_years: int = Query(3, ge=1, le=5),
+    flight_limit: int = Query(600, ge=50, le=1000),
+    max_moved_flights: Optional[int] = Query(None, ge=0),
+):
+    """Check whether the schedule experiment behaves stably in prior years.
+
+    It deliberately validates the optimizer's simulated peak-reduction result,
+    not a causal claim about observed delays after a schedule intervention.
+    """
+    if window_end_hour <= window_start_hour:
+        raise HTTPException(status_code=400, detail="window_end_hour must be after window_start_hour")
+    if start_date and end_date and start_date > end_date:
+        raise HTTPException(status_code=400, detail="start_date must be on or before end_date")
+    if not start_date or not end_date:
+        with open_readonly_connection() as connection:
+            max_date = connection.execute("SELECT MAX(FlightDate) FROM flights").fetchone()[0]
+        end_date = end_date or str(max_date)
+        start_date = start_date or str(date.fromisoformat(str(max_date)) - timedelta(days=90))
+    try:
+        with open_readonly_connection() as connection:
+            return validate_departure_bank_history(
+                connection,
+                airport=airport,
+                carrier=carrier,
+                start_date=start_date,
+                end_date=end_date,
+                window_start_hour=window_start_hour,
+                window_end_hour=window_end_hour,
+                allowed_shift_minutes=allowed_shift_minutes,
+                maximum_windows=maximum_windows,
+                reference_lookback_years=reference_lookback_years,
+                flight_limit=flight_limit,
+                max_moved_flights=max_moved_flights,
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/summary")
@@ -2676,6 +2726,28 @@ def route_panel_forecast(
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+
+
+@app.get("/api/model-evidence/route-panel")
+def route_panel_model_evidence(
+    refresh: bool = Query(
+        False,
+        description="Rebuild the cached rolling evaluation instead of returning its six-hour cached evidence.",
+    ),
+):
+    """Repeated chronological evidence for the route-panel models.
+
+    This endpoint can take noticeably longer than a normal dashboard request
+    the first time because it fits several small models across several later
+    holdout windows. It is researcher-facing by design and cached afterward.
+    """
+    try:
+        with open_readonly_connection() as connection:
+            return build_route_panel_temporal_evidence(connection, force=refresh)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.get("/api/carrier-detail")

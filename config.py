@@ -36,6 +36,10 @@ NOTEBOOK_DIR = BASE_DIR / "Notebooks"
 APRIL_2026_FILE = DATA_DIR / "OTP_APR2026.csv"
 PIPELINE_STATE_FILE = DATA_DIR / "pipeline_state.json"
 T100_PIPELINE_STATE_FILE = DATA_DIR / "t100_pipeline_state.json"
+# A single, human-readable record for the coordinated monthly refresh.  This
+# stays under Data/ (which is intentionally ignored by Git) because it
+# describes the local warehouse, not portable source code.
+REFRESH_STATE_FILE = DATA_DIR / "refresh_state.json"
 CONSOLIDATED_FILE = DATA_DIR / "OTP_CONSOLIDATED_ALL.csv"
 WAREHOUSE_DIR = DATA_DIR / "Warehouse"
 DUCKDB_FILE = _path_from_env(
