@@ -168,6 +168,14 @@ month.
 Before the enrichment tables are loaded, those endpoints report that state
 explicitly; they do not substitute fabricated values.
 
+The researcher-only portfolio replay at
+`/api/decision/network-protection-validation` checks a different question. It
+builds the exact same shortlist from an earlier 12-month reference window,
+then compares that list with the other historical candidates in a later,
+non-overlapping three-month outcome window. This tests whether the declared
+priority metric stayed concentrated in the earlier selection. It is not an
+intervention simulation or a causal improvement estimate.
+
 ### Monthly refresh and portable-source checks
 
 Once the warehouse exists, the normal monthly maintenance command is:

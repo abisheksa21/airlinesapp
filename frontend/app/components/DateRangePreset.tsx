@@ -1,8 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
-type Mode = "year" | "occasion" | "custom";
+type Mode = "all" | "year" | "month" | "occasion" | "custom";
 
 const YEARS = [2026, 2025, 2024, 2023, 2022, 2021, 2020, 2019, 2018];
 
@@ -78,14 +78,39 @@ const OCCASIONS: Record<string, Record<number, { start: string; end: string }>> 
 };
 
 const OCCASION_NAMES = Object.keys(OCCASIONS);
+const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 
-function detectMode(startDate: string, endDate: string): Mode {
-  if (!startDate && !endDate) return "year";
-  for (const year of YEARS) {
-    if (startDate === `${year}-01-01` && endDate === `${year}-12-31`) return "year";
+function monthValueForRange(startDate: string, endDate: string): string {
+  if (!startDate || !endDate) return "";
+  const [year, month] = startDate.split("-").map(Number);
+  const lastDay = new Date(year, month, 0).getDate();
+  return startDate === `${year}-${String(month).padStart(2, "0")}-01` && endDate === `${year}-${String(month).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`
+    ? `${year}-${String(month).padStart(2, "0")}`
+    : "";
+}
+
+function yearsThrough(latestAvailableDate?: string): number[] {
+  if (!latestAvailableDate) return YEARS;
+  const latestYear = Number(latestAvailableDate.slice(0, 4));
+  return YEARS.filter((year) => year <= latestYear);
+}
+
+function occasionYearsThrough(name: string, latestAvailableDate?: string): number[] {
+  return yearsThrough(latestAvailableDate).filter((year) => {
+    const window = OCCASIONS[name]?.[year];
+    return Boolean(window && (!latestAvailableDate || window.end <= latestAvailableDate));
+  });
+}
+
+function detectMode(startDate: string, endDate: string, publicModes: boolean, latestAvailableDate?: string): Mode {
+  if (!startDate && !endDate) return publicModes ? "all" : "year";
+  if (publicModes && monthValueForRange(startDate, endDate)) return "month";
+  for (const year of yearsThrough(latestAvailableDate)) {
+    const yearEnd = latestAvailableDate?.startsWith(`${year}-`) ? latestAvailableDate : `${year}-12-31`;
+    if (startDate === `${year}-01-01` && endDate === yearEnd) return "year";
   }
   for (const name of OCCASION_NAMES) {
-    for (const year of YEARS) {
+    for (const year of occasionYearsThrough(name, latestAvailableDate)) {
       const w = OCCASIONS[name][year];
       if (w && w.start === startDate && w.end === endDate) return "occasion";
     }
@@ -97,20 +122,50 @@ export default function DateRangePreset({
   startDate,
   endDate,
   onChange,
+  onReadyChange,
+  includeAllTimeAndMonth = false,
+  latestAvailableDate,
 }: {
   startDate: string;
   endDate: string;
   onChange: (start: string, end: string) => void;
+  onReadyChange?: (ready: boolean) => void;
+  includeAllTimeAndMonth?: boolean;
+  latestAvailableDate?: string;
 }) {
-  const [mode, setMode] = useState<Mode>(() => detectMode(startDate, endDate));
+  const [mode, setMode] = useState<Mode>(() => detectMode(startDate, endDate, includeAllTimeAndMonth, latestAvailableDate));
   const [occasion, setOccasion] = useState<string>(OCCASION_NAMES[0]);
+  const years = yearsThrough(latestAvailableDate);
+  const withinCoverage = !latestAvailableDate || !endDate || endDate <= latestAvailableDate;
+  const rangeReady = !includeAllTimeAndMonth || mode === "all" || Boolean(startDate && endDate && startDate <= endDate && withinCoverage);
+
+  useEffect(() => {
+    onReadyChange?.(rangeReady);
+  }, [onReadyChange, rangeReady]);
+
+  useEffect(() => {
+    if (!includeAllTimeAndMonth || !latestAvailableDate) return;
+    if (startDate && startDate > latestAvailableDate) onChange(latestAvailableDate, latestAvailableDate);
+    else if (endDate && endDate > latestAvailableDate) onChange(startDate, latestAvailableDate);
+  }, [endDate, includeAllTimeAndMonth, latestAvailableDate, onChange, startDate]);
+
+  function selectMonth(value: string) {
+    if (!value) {
+      onChange("", "");
+      return;
+    }
+    const [year, month] = value.split("-").map(Number);
+    const lastDay = new Date(year, month, 0).getDate();
+    onChange(`${year}-${String(month).padStart(2, "0")}-01`, `${year}-${String(month).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`);
+  }
 
   function selectYear(year: string) {
     if (!year) {
       onChange("", "");
       return;
     }
-    onChange(`${year}-01-01`, `${year}-12-31`);
+    const yearEnd = latestAvailableDate?.startsWith(`${year}-`) ? latestAvailableDate : `${year}-12-31`;
+    onChange(`${year}-01-01`, yearEnd);
   }
 
   function selectOccasionYear(occasionName: string, year: string) {
@@ -118,9 +173,12 @@ export default function DateRangePreset({
     if (w) onChange(w.start, w.end);
   }
 
-  const matchedYear = YEARS.find((y) => startDate === `${y}-01-01` && endDate === `${y}-12-31`);
+  const matchedYear = years.find((y) => {
+    const yearEnd = latestAvailableDate?.startsWith(`${y}-`) ? latestAvailableDate : `${y}-12-31`;
+    return startDate === `${y}-01-01` && endDate === yearEnd;
+  });
   let matchedOccasionYear: number | undefined;
-  for (const y of YEARS) {
+  for (const y of occasionYearsThrough(occasion, latestAvailableDate)) {
     const w = OCCASIONS[occasion]?.[y];
     if (w && w.start === startDate && w.end === endDate) matchedOccasionYear = y;
   }
@@ -134,24 +192,47 @@ export default function DateRangePreset({
           onChange={(e) => {
             const next = e.target.value as Mode;
             setMode(next);
-            if (next === "year") selectYear("");
-            if (next === "custom") onChange("", "");
+            if (includeAllTimeAndMonth) {
+              if (next === "all" || next === "month" || next === "occasion" || next === "custom") onChange("", "");
+              if (next === "year") selectYear("");
+            } else {
+              if (next === "year") selectYear("");
+              if (next === "custom") onChange("", "");
+            }
           }}
         >
+          {includeAllTimeAndMonth && <option value="all">All time</option>}
           <option value="year">Year</option>
-          <option value="occasion">Occasion</option>
-          <option value="custom">Custom</option>
+          {includeAllTimeAndMonth && <option value="month">Month</option>}
+          <option value="occasion">{includeAllTimeAndMonth ? "Holiday / occasion" : "Occasion"}</option>
+          <option value="custom">{includeAllTimeAndMonth ? "Custom dates" : "Custom"}</option>
         </select>
       </label>
+
+      {includeAllTimeAndMonth && mode === "all" && <span className="filter-field filter-period-note"><span className="filter-label">Selected period</span><strong>All available history</strong></span>}
 
       {mode === "year" && (
         <label className="filter-field">
           <span className="filter-label">Year</span>
           <select value={matchedYear ?? ""} onChange={(e) => selectYear(e.target.value)}>
-            <option value="">All time</option>
-            {YEARS.map((y) => (
+            <option value="">{includeAllTimeAndMonth ? "Choose a year" : "All time"}</option>
+            {years.map((y) => (
               <option key={y} value={y}>{y}</option>
             ))}
+          </select>
+        </label>
+      )}
+
+      {mode === "month" && (
+        <label className="filter-field">
+          <span className="filter-label">Month</span>
+          <select value={monthValueForRange(startDate, endDate)} onChange={(e) => selectMonth(e.target.value)}>
+            <option value="">Choose a month</option>
+            {years.flatMap((year) => MONTH_NAMES.map((name, index) => {
+              const month = String(index + 1).padStart(2, "0");
+              if (latestAvailableDate && `${year}-${month}` > latestAvailableDate.slice(0, 7)) return [];
+              return <option key={`${year}-${month}`} value={`${year}-${month}`}>{name} {year}</option>;
+            }))}
           </select>
         </label>
       )}
@@ -179,7 +260,7 @@ export default function DateRangePreset({
               onChange={(e) => selectOccasionYear(occasion, e.target.value)}
             >
               <option value="">Select year</option>
-              {YEARS.filter((y) => OCCASIONS[occasion]?.[y]).map((y) => (
+              {occasionYearsThrough(occasion, latestAvailableDate).map((y) => (
                 <option key={y} value={y}>
                   {occasion === "Christmas / New Year" ? `${y}\u2013${y + 1}` : y}
                 </option>
@@ -197,6 +278,7 @@ export default function DateRangePreset({
               type="date"
               value={startDate}
               min="2018-01-01"
+              max={includeAllTimeAndMonth ? endDate || latestAvailableDate : undefined}
               onChange={(e) => onChange(e.target.value, endDate)}
             />
           </label>
@@ -205,7 +287,8 @@ export default function DateRangePreset({
             <input
               type="date"
               value={endDate}
-              min="2018-01-01"
+              min={includeAllTimeAndMonth ? startDate || "2018-01-01" : "2018-01-01"}
+              max={includeAllTimeAndMonth ? latestAvailableDate : undefined}
               onChange={(e) => onChange(startDate, e.target.value)}
             />
           </label>

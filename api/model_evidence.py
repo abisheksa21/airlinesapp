@@ -61,6 +61,27 @@ def _evenly_spaced(items: list[str], count: int) -> list[str]:
     return [items[position] for position in sorted(set(positions))]
 
 
+def _non_overlapping_cutoffs(cutoffs: list[str], *, test_horizon_months: int) -> list[str]:
+    """Keep future test windows separate before choosing representative ones.
+
+    Consecutive monthly cutoffs are all eligible individually, but their
+    multi-month test windows can overlap.  Reusing the same future outcome in
+    several rows would make a repeated test look more independent than it is.
+    This helper builds a chronological subset with at least one full test
+    horizon between starts.  Training windows may expand and overlap; only the
+    untouched outcome windows must remain distinct.
+    """
+    selected: list[str] = []
+    next_allowed_index: int | None = None
+    for cutoff in sorted(cutoffs):
+        cutoff_index = _period_index(cutoff)
+        if next_allowed_index is not None and cutoff_index < next_allowed_index:
+            continue
+        selected.append(cutoff)
+        next_allowed_index = cutoff_index + test_horizon_months
+    return selected
+
+
 def _method_specs(examples: list[dict[str, Any]]) -> list[dict[str, Any]]:
     traffic_index = PANEL_FEATURE_NAMES.index("traffic_context_available")
     operational_index = PANEL_FEATURE_NAMES.index("operational_context_available")
@@ -128,7 +149,11 @@ def _window_metrics(
 
 def _aggregate_windows(
     windows: list[dict[str, Any]], method_ids: list[str]
-) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, int]]]:
+) -> tuple[
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, int]],
+    dict[str, dict[str, dict[str, Any]]],
+]:
     aggregate: dict[str, dict[str, Any]] = {}
     winner_counts: dict[str, dict[str, int]] = {
         target: {method_id: 0 for method_id in method_ids} for target in TARGETS
@@ -162,7 +187,54 @@ def _aggregate_windows(
             for method_id, value in usable:
                 if abs(float(value) - best) < 1e-12:
                     winner_counts[target][method_id] += 1
-    return aggregate, winner_counts
+
+    # The historical baseline remains the decision anchor.  A more complex
+    # candidate is not "promoted" merely because it wins one convenient
+    # split: it must lower aggregate error AND win more non-overlapping future
+    # windows than it loses against the baseline for the same target.
+    baseline = aggregate.get("math_baseline", {})
+    comparisons: dict[str, dict[str, dict[str, Any]]] = {}
+    for target in TARGETS:
+        metric = f"{target}_mae"
+        target_comparisons: dict[str, dict[str, Any]] = {}
+        baseline_value = baseline.get(metric)
+        for method_id in method_ids:
+            if method_id == "math_baseline":
+                continue
+            candidate_value = aggregate.get(method_id, {}).get(metric)
+            wins = losses = ties = 0
+            for window in windows:
+                candidate = window["metrics"][method_id].get(metric)
+                reference = window["metrics"]["math_baseline"].get(metric)
+                if candidate is None or reference is None:
+                    continue
+                if float(candidate) < float(reference) - 1e-12:
+                    wins += 1
+                elif float(candidate) > float(reference) + 1e-12:
+                    losses += 1
+                else:
+                    ties += 1
+            delta = (
+                round(float(candidate_value) - float(baseline_value), 6)
+                if candidate_value is not None and baseline_value is not None
+                else None
+            )
+            relative_change = (
+                round((float(baseline_value) - float(candidate_value)) / float(baseline_value), 6)
+                if candidate_value is not None and baseline_value not in (None, 0)
+                else None
+            )
+            supported = bool(delta is not None and delta < 0 and wins > losses)
+            target_comparisons[method_id] = {
+                "aggregate_mae_change_vs_baseline": delta,
+                "relative_mae_improvement_vs_baseline": relative_change,
+                "windows_better_than_baseline": wins,
+                "windows_worse_than_baseline": losses,
+                "windows_tied_with_baseline": ties,
+                "status": "supported_candidate" if supported else "keep_exploratory",
+            }
+        comparisons[target] = target_comparisons
+    return aggregate, winner_counts, comparisons
 
 
 def _build_evidence(
@@ -214,7 +286,11 @@ def _build_evidence(
         test_horizon_months=test_horizon_months,
         minimum_training_examples=minimum_training_examples,
     )
-    selected_cutoffs = _evenly_spaced(cutoffs, max_windows)
+    independent_cutoffs = _non_overlapping_cutoffs(
+        cutoffs,
+        test_horizon_months=test_horizon_months,
+    )
+    selected_cutoffs = _evenly_spaced(independent_cutoffs, max_windows)
     if len(selected_cutoffs) < 2:
         return {
             "status": "insufficient_history",
@@ -252,7 +328,7 @@ def _build_evidence(
     method_ids = [method["id"] for method in method_records]
     if not windows:
         return {"status": "insufficient_history", "reason": "No repeated time windows met the sample safeguards."}
-    aggregate, winner_counts = _aggregate_windows(windows, method_ids)
+    aggregate, winner_counts, comparisons = _aggregate_windows(windows, method_ids)
 
     traffic_index = PANEL_FEATURE_NAMES.index("traffic_context_available")
     operational_index = PANEL_FEATURE_NAMES.index("operational_context_available")
@@ -279,16 +355,19 @@ def _build_evidence(
             "test_horizon_months": test_horizon_months,
             "minimum_training_periods": minimum_training_periods,
             "minimum_training_examples": minimum_training_examples,
+            "test_windows_do_not_overlap": True,
             "windows": windows,
             "aggregate": aggregate,
             "winner_counts_by_target": winner_counts,
+            "comparison_to_historical_baseline": comparisons,
         },
         "methods": method_records,
         "methodology": {
-            "design": "Rolling time-based holdouts. Each row is scored only after its feature month, then tested on later months never used for fitting.",
+            "design": "Rolling time-based holdouts with non-overlapping future test windows. Each row is scored only after its feature month, then tested on later months never used for fitting.",
             "t100_boundary": "T-100 route traffic is ASOF joined only when its month is strictly earlier than the OTP outcome month.",
             "operational_boundary": "WeatherDelay, NASDelay, departure delay, and departure concentration are origin-airport history from a strictly earlier month.",
-            "interpretation": "Lower MAE means closer predictions. Repeated wins support predictive usefulness; they do not prove that traffic or operational drivers caused a later result.",
+            "promotion_rule": "A candidate is only labelled supported for a target when it lowers aggregate MAE and wins more separate future windows than it loses against the transparent historical baseline.",
+            "interpretation": "Lower MAE means closer predictions. Repeated wins in non-overlapping future windows support predictive usefulness; they do not prove that traffic or operational drivers caused a later result.",
         },
     }
 

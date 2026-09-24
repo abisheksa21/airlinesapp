@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
+import { useSearchParams } from "next/navigation";
 import ReactMarkdown from "react-markdown";
 import { useMode } from "../lib/mode";
 import DistanceBucketChart from "../components/DistanceBucketChart";
@@ -13,6 +14,8 @@ import TurnbackSummary from "../components/TurnbackSummary";
 import DiversionLandingChart from "../components/DiversionLandingChart";
 import SchedulePaddingChart from "../components/SchedulePaddingChart";
 import FlexibleQueryChart from "../components/FlexibleQueryChart";
+import { ChartFrame } from "../components/product/ChartFrame";
+import { useResearchContext } from "../lib/research-context";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8200";
 
@@ -48,10 +51,10 @@ const STORAGE_KEY = "copilot_conversations_v1";
 // this browser only -- not synced across devices, cleared if the user
 // clears site data. Good enough for "let me revisit what I asked
 // yesterday," not a substitute for a real account-backed history.
-function loadConversations(): Conversation[] {
+function loadConversations(storageKey = STORAGE_KEY): Conversation[] {
   if (typeof window === "undefined") return [];
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
+    const raw = window.localStorage.getItem(storageKey);
     const parsed = raw ? JSON.parse(raw) : [];
     return Array.isArray(parsed) ? parsed : [];
   } catch {
@@ -59,10 +62,10 @@ function loadConversations(): Conversation[] {
   }
 }
 
-function saveConversations(conversations: Conversation[]) {
+function saveConversations(conversations: Conversation[], storageKey = STORAGE_KEY) {
   if (typeof window === "undefined") return;
   try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(conversations));
+    window.localStorage.setItem(storageKey, JSON.stringify(conversations));
   } catch {
     // Storage unavailable or quota exceeded -- chat still works for this
     // session, it just won't persist. Not worth surfacing as an error.
@@ -112,8 +115,26 @@ function toolLabel(tool: string): string {
   return `${tool}()`;
 }
 
+function resultPeriod(result: any): string {
+  const start = result?.start_date ?? result?.period?.start_date ?? result?.filters?.start_date;
+  const end = result?.end_date ?? result?.period?.end_date ?? result?.filters?.end_date;
+  return start || end ? `${start ?? "earliest"} to ${end ?? "latest"}` : "Tool-specific historical scope";
+}
+
+function resultSample(result: any): string | undefined {
+  const value = result?.total_flights ?? result?.overview?.total_flights ?? result?.examples ?? result?.count;
+  return typeof value === "number" ? value.toLocaleString() : undefined;
+}
+
+function CopilotEvidenceFrame({ tool, result, children }: { tool: string; result: any; children: React.ReactNode }) {
+  return <ChartFrame title={`Evidence returned by ${toolLabel(tool)}`} interpretation="This visual is produced from the cited backend tool used for this answer, rather than an unverified generated claim." evidence={{ source: `FastAPI evidence tool: ${toolLabel(tool)}`, period: resultPeriod(result), sample: resultSample(result), method: "Server-side historical aggregation", caveat: "Tool outputs remain historical and descriptive. They do not establish causation or guarantee a future flight outcome." }}>{children}</ChartFrame>;
+}
+
 export default function CopilotPage() {
   const { mode } = useMode();
+  const conversationStorageKey = mode === "public" ? `${STORAGE_KEY}_public` : STORAGE_KEY;
+  const { summary: contextSummary } = useResearchContext();
+  const searchParams = useSearchParams();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -128,7 +149,12 @@ export default function CopilotPage() {
   const activeIdRef = useRef<string>("");
 
   useEffect(() => {
-    const loaded = loadConversations().sort((a, b) => b.updatedAt - a.updatedAt);
+    const question = searchParams.get("question")?.trim();
+    if (question && messages.length === 0) setInput(question);
+  }, [messages.length, searchParams]);
+
+  useEffect(() => {
+    const loaded = loadConversations(conversationStorageKey).sort((a, b) => b.updatedAt - a.updatedAt);
     setConversations(loaded);
     if (loaded.length > 0) {
       activeIdRef.current = loaded[0].id;
@@ -138,7 +164,7 @@ export default function CopilotPage() {
       activeIdRef.current = newConversationId();
       setActiveId(activeIdRef.current);
     }
-  }, []);
+  }, [conversationStorageKey]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -161,10 +187,10 @@ export default function CopilotPage() {
         ? prev.map((c) => (c.id === id ? updated : c))
         : [updated, ...prev];
       next.sort((a, b) => b.updatedAt - a.updatedAt);
-      saveConversations(next);
+      saveConversations(next, conversationStorageKey);
       return next;
     });
-  }, [messages, loading]);
+  }, [messages, loading, conversationStorageKey]);
 
   function startNewChat() {
     activeIdRef.current = newConversationId();
@@ -183,7 +209,7 @@ export default function CopilotPage() {
     e.stopPropagation();
     setConversations((prev) => {
       const next = prev.filter((c) => c.id !== id);
-      saveConversations(next);
+      saveConversations(next, conversationStorageKey);
       return next;
     });
     if (activeIdRef.current === id) {
@@ -226,10 +252,13 @@ export default function CopilotPage() {
     const toolEvidence: ToolEvidence[] = [];
 
     try {
+      const scopedMessage = mode !== "researcher" || contextSummary === "No shared filters selected"
+        ? message
+        : `${message}\n\nActive research context: ${contextSummary}. Use it only when the chosen historical tool supports the specified filters; say clearly when it does not.`;
       const res = await fetch(`${API_BASE}/api/copilot/chat/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message, history, tier: mode }),
+        body: JSON.stringify({ message: scopedMessage, history, tier: mode }),
       });
 
       if (!res.ok || !res.body) {
@@ -320,15 +349,19 @@ export default function CopilotPage() {
   return (
     <main className="page copilot-page">
       <header className="header">
-        <p className="eyebrow">DOT On-Time Performance &middot; Copilot</p>
-        <h1 className="title">Ask the data</h1>
+        <p className="eyebrow">{mode === "public" ? "PUBLIC FLIGHT RECORD · COPILOT" : "RESEARCH WORKSPACE · COPILOT"}</p>
+        <h1 className="title">{mode === "public" ? "Public Copilot" : "Research Copilot"}</h1>
         <p className="subtitle">
-          Grounded in the same 60M-flight warehouse as the stats page &mdash; every answer comes from a real query, not a guess.
+          {mode === "public"
+            ? "Ask questions about historical U.S. flight performance in a familiar chat, and return to your saved conversations whenever you like."
+            : "Ask evidence-led questions across the flight warehouse, with shared research filters and tool-level results."}
         </p>
         <p className="page-note" style={{ marginTop: "0.4rem" }}>
-          Running in {mode === "researcher" ? "Researcher mode" : "Public mode"} &mdash; switch in the
-          nav bar for a {mode === "researcher" ? "faster, lighter" : "deeper, more capable"} model.
+          {mode === "public"
+            ? "Claude Haiku · conversation history is saved in this browser. The floating Ask Copilot panel is separate and temporary."
+            : "Research Copilot uses the Sonnet tier for deeper, tool-driven analysis. It receives the shared research filters and reports when a tool cannot apply them."}
         </p>
+        {mode === "researcher" && <p className="research-scope-note"><strong>Active research context:</strong> {contextSummary}. Copilot receives this scope with your question and must state if a selected evidence tool cannot apply part of it.</p>}
       </header>
 
       <div className="copilot-layout">
@@ -339,7 +372,7 @@ export default function CopilotPage() {
           <div className="copilot-conversation-list">
             {conversations.length === 0 && (
               <p className="page-note" style={{ padding: "0.5rem" }}>
-                Past chats will show up here &mdash; saved in this browser only.
+                Past chats will show up here &mdash; saved in this browser only, not synced to an account.
               </p>
             )}
             {conversations.map((conv) => (
@@ -400,7 +433,7 @@ export default function CopilotPage() {
                 {m.evidence.map((e, j) => {
                   const renderer = EVIDENCE_RENDERERS[e.tool];
                   const node = renderer ? renderer(e.result) : null;
-                  return node ? <div key={j} style={{ marginTop: "1rem" }}>{node}</div> : null;
+                  return node ? <div key={j} style={{ marginTop: "1rem" }}><CopilotEvidenceFrame tool={e.tool} result={e.result}>{node}</CopilotEvidenceFrame></div> : null;
                 })}
               </div>
             )}
@@ -438,4 +471,3 @@ export default function CopilotPage() {
     </main>
   );
 }
-

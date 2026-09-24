@@ -7,19 +7,16 @@ export default function GlossaryPage() {
   const content = fs.readFileSync(filePath, "utf-8");
 
   return (
-    <main className="page">
-      <header className="header">
-        <p className="eyebrow">DOT On-Time Performance &middot; Glossary</p>
-        <h1 className="title">Glossary</h1>
-        <p className="subtitle">
-          Every term used anywhere on this site, defined once, in one place.
-        </p>
+    <main className="public-page public-reference-page">
+      <header className="public-reference-hero">
+        <span className="section-label">Reference / glossary</span>
+        <h1>A common language for the network.</h1>
+        <p>Every operational term used in the public brief and researcher workspace is defined once here—so a “delay,” “on-time,” or “connection score” never means different things on different pages.</p>
+        <div><span>Plain-language definitions</span><span>Linked from evidence views</span><span>Built around BTS fields</span></div>
       </header>
-
-      <section className="section">
-        <div className="screen markdown-page">
-          <MarkdownBody content={content} />
-        </div>
+      <section className="public-reference-layout">
+        <aside><span className="section-label">How to use it</span><p>Definitions explain the terminology; they do not change the source data, model scope, or analytical caveats. For those, use Methodology.</p><a href="/methodology">Open methodology →</a></aside>
+        <div className="public-markdown"><MarkdownBody content={content} /></div>
       </section>
     </main>
   );

@@ -311,6 +311,34 @@ def airport_public_profile(connection: Any, airport: str) -> dict[str, Any] | No
         """,
         [airport],
     ).fetchall()
+    top_routes = connection.execute(
+        """
+        SELECT
+            route,
+            SUM(total_flights) AS total_flights,
+            SUM(total_flights * on_time_rate) / NULLIF(SUM(total_flights), 0) AS on_time_rate
+        FROM (
+            SELECT
+                origin AS airport,
+                origin || ' → ' || dest AS route,
+                total_flights,
+                on_time_rate
+            FROM analytics_route_month
+            UNION ALL
+            SELECT
+                dest AS airport,
+                origin || ' → ' || dest AS route,
+                total_flights,
+                on_time_rate
+            FROM analytics_route_month
+        ) routes
+        WHERE airport = ?
+        GROUP BY route
+        ORDER BY total_flights DESC
+        LIMIT 10
+        """,
+        [airport],
+    ).fetchall()
     return {
         "airport": airport,
         "city": None,
@@ -324,5 +352,8 @@ def airport_public_profile(connection: Any, airport: str) -> dict[str, Any] | No
         "inbound": None,
         "months": [{"month": r[0], "total_flights": int(r[1]), "on_time_rate": r[2]} for r in months],
         "causes": [],
-        "top_routes": [],
+        "top_routes": [
+            {"route": route, "total_flights": int(total_flights), "on_time_rate": on_time_rate}
+            for route, total_flights, on_time_rate in top_routes
+        ],
     }

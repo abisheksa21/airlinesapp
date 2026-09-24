@@ -1,26 +1,20 @@
 import fs from "fs";
 import path from "path";
-import MarkdownBody from "../components/MarkdownBody";
+import MethodologyReader from "./MethodologyReader";
 
 export default function MethodologyPage() {
   const filePath = path.join(process.cwd(), "app", "methodology", "content.md");
   const content = fs.readFileSync(filePath, "utf-8");
 
   return (
-    <main className="page">
-      <header className="header">
-        <p className="eyebrow">DOT On-Time Performance &middot; Methodology</p>
-        <h1 className="title">How the analysis works</h1>
-        <p className="subtitle">
-          Plain-language explanations first, then the full formulas for the Health Score and Decision Center.
-        </p>
+    <main className="public-page public-reference-page methodology-page">
+      <header className="public-reference-hero">
+        <span className="section-label">Reference / methods</span>
+        <h1>How each result is built.</h1>
+        <p>Choose a topic. Start with the plain-language answer; expand a section only when you want the formulas, checks, and assumptions.</p>
+        <div><span>Historical DOT / BTS records</span><span>Descriptive · predictive · what-if</span><span>Association is not causation</span></div>
       </header>
-
-      <section className="section">
-        <div className="screen markdown-page">
-          <MarkdownBody content={content} />
-        </div>
-      </section>
+      <MethodologyReader content={content} />
     </main>
   );
 }

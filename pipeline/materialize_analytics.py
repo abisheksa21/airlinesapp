@@ -229,16 +229,22 @@ def build_analytics_tables(connection: Any) -> dict[str, int]:
             GROUP BY year_month
             ORDER BY year_month
         """,
-        "analytics_carrier_month": """
+        "analytics_carrier_month": f"""
             CREATE OR REPLACE TABLE analytics_carrier_month AS
             SELECT
                 Marketing_Airline_Network AS carrier,
                 strftime(FlightDate, '%Y-%m') AS year_month,
                 COUNT(*) AS total_flights,
-                COUNT(*) FILTER (WHERE Cancelled = 0 AND ArrDelay IS NOT NULL) AS completed_flights,
-                AVG(CASE WHEN Cancelled = 0 THEN CASE WHEN ArrDel15 = 0 THEN 1.0 ELSE 0.0 END END) AS on_time_rate,
-                AVG(CASE WHEN Cancelled = 0 THEN ArrDelay END) AS avg_arrival_delay_minutes,
-                AVG(Cancelled * 1.0) AS cancellation_rate
+                COUNT(*) FILTER (WHERE {COMPLETED_FLIGHT_SQL}) AS completed_flights,
+                AVG(CASE WHEN {COMPLETED_FLIGHT_SQL}
+                    THEN CASE WHEN {ON_TIME_FLAG_SQL} THEN 1.0 ELSE 0.0 END
+                END) AS on_time_rate,
+                AVG(CASE WHEN {COMPLETED_FLIGHT_SQL} THEN ArrDelay END) AS avg_arrival_delay_minutes,
+                AVG(CASE WHEN {SEVERE_DELAY_SQL} THEN 1.0
+                    WHEN {COMPLETED_FLIGHT_SQL} THEN 0.0
+                END) AS severe_delay_rate,
+                AVG(Cancelled * 1.0) AS cancellation_rate,
+                AVG(Diverted * 1.0) AS diversion_rate
             FROM analytics_flight_core
             WHERE FlightDate IS NOT NULL AND Marketing_Airline_Network IS NOT NULL
             GROUP BY Marketing_Airline_Network, year_month
@@ -299,16 +305,23 @@ def build_analytics_tables(connection: Any) -> dict[str, int]:
         # exposure, and how concentrated scheduled departures were in the
         # airport's busiest clock hour.  It is not a live weather feed, an
         # FAA capacity declaration, or a causal attribution table.
-        "analytics_airport_operational_month": """
+        "analytics_airport_operational_month": f"""
             CREATE OR REPLACE TABLE analytics_airport_operational_month AS
             WITH airport_month AS (
                 SELECT
                     Origin AS airport,
                     strftime(FlightDate, '%Y-%m') AS year_month,
                     COUNT(*) AS total_departures,
-                    COUNT(*) FILTER (
-                        WHERE Cancelled = 0 AND DepDelay IS NOT NULL
-                    ) AS completed_departures,
+                    COUNT(*) FILTER (WHERE {COMPLETED_FLIGHT_SQL}) AS completed_departures,
+                    AVG(CASE WHEN {COMPLETED_FLIGHT_SQL}
+                        THEN CASE WHEN {ON_TIME_FLAG_SQL} THEN 1.0 ELSE 0.0 END
+                    END) AS on_time_rate,
+                    AVG(CASE WHEN {COMPLETED_FLIGHT_SQL} THEN ArrDelay END) AS avg_arrival_delay_minutes,
+                    AVG(CASE WHEN {SEVERE_DELAY_SQL} THEN 1.0
+                        WHEN {COMPLETED_FLIGHT_SQL} THEN 0.0
+                    END) AS severe_delay_rate,
+                    AVG(Cancelled * 1.0) AS cancellation_rate,
+                    AVG(Diverted * 1.0) AS diversion_rate,
                     AVG(CASE
                         WHEN Cancelled = 0 AND DepDelay IS NOT NULL THEN DepDelay
                     END) AS avg_departure_delay_minutes,
@@ -351,6 +364,11 @@ def build_analytics_tables(connection: Any) -> dict[str, int]:
                 month.year_month,
                 month.total_departures,
                 month.completed_departures,
+                month.on_time_rate,
+                month.avg_arrival_delay_minutes,
+                month.severe_delay_rate,
+                month.cancellation_rate,
+                month.diversion_rate,
                 month.avg_departure_delay_minutes,
                 month.weather_affected_rate,
                 month.weather_delay_minutes_per_departure,

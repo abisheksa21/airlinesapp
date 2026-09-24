@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useCallback, Suspense } from "react";
+import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { CARRIER_NAMES, carrierColor, carrierName } from "../lib/carriers";
 import ComparisonChart, { ScenarioTrend } from "../components/ComparisonChart";
@@ -112,11 +113,11 @@ export default function ComparePage() {
 
 function ComparePageInner() {
   const searchParams = useSearchParams();
-  const linkedMode = searchParams.get("mode"); // "carrier" | "airport" | "route" | "aircraft"
+  const linkedMode = searchParams.get("mode"); // Public comparison modes only.
   const linkedEntity = searchParams.get("entity");
   const linkedCarrier = searchParams.get("carrier");
 
-  const VALID_MODES = ["carrier", "airport", "route", "aircraft"] as const;
+  const VALID_MODES = ["carrier", "airport", "route"] as const;
   type Mode = (typeof VALID_MODES)[number];
   const [mode, setMode] = useState<Mode>(
     VALID_MODES.includes(linkedMode as Mode) ? (linkedMode as Mode) : "carrier"
@@ -213,44 +214,41 @@ function ComparePageInner() {
     }));
 
   return (
-    <main className="page">
-      <header className="header">
-        <p className="eyebrow">DOT On-Time Performance &middot; Compare</p>
-        <h1 className="title">Compare</h1>
-        <p className="subtitle">
-          Any number of carriers, airports, routes, or aircraft &mdash; side by side, same real
-          warehouse data.
-        </p>
+    <main className="public-page public-compare-page">
+      <header className="public-compare-header">
+        <div><p className="section-label">PUBLIC VIEW · SIDE-BY-SIDE HISTORY</p>
+        <h1>Compare the flight record.</h1>
+        <p>Compare airlines, airports, or one-way routes across the same historical measures. Choose the entities and period; differences describe history, not cause.</p></div>
+        <Link href="/methodology">How comparisons work ↗</Link>
       </header>
 
+      <div className="compare-howto" aria-label="How to compare"><span><b>1</b> Choose what to compare</span><i /> <span><b>2</b> Set matching periods</span><i /> <span><b>3</b> Read differences and trend</span></div>
+
       <div className="compare-mode-toggle">
-        <button type="button" className={mode === "carrier" ? "compare-mode-active" : ""} onClick={() => setMode("carrier")}>
+        <button type="button" aria-pressed={mode === "carrier"} className={mode === "carrier" ? "compare-mode-active" : ""} onClick={() => setMode("carrier")}>
           Carrier
         </button>
-        <button type="button" className={mode === "airport" ? "compare-mode-active" : ""} onClick={() => setMode("airport")}>
+        <button type="button" aria-pressed={mode === "airport"} className={mode === "airport" ? "compare-mode-active" : ""} onClick={() => setMode("airport")}>
           Airport
         </button>
-        <button type="button" className={mode === "route" ? "compare-mode-active" : ""} onClick={() => setMode("route")}>
+        <button type="button" aria-pressed={mode === "route"} className={mode === "route" ? "compare-mode-active" : ""} onClick={() => setMode("route")}>
           Route
         </button>
-        <button type="button" className={mode === "aircraft" ? "compare-mode-active" : ""} onClick={() => setMode("aircraft")}>
-          Aircraft
-        </button>
       </div>
+
+      <p className="compare-mode-caption">{mode === "carrier" ? "Compare airlines across selected periods. Choose one or more carriers in each period; leave all unselected to compare the whole industry." : mode === "airport" ? "Compare airport activity and associated flight outcomes for a consistent date range." : "Compare one-way routes; the reverse direction is a separate result."}</p>
 
       {mode === "airport" && (
         <EntityCompare key="airport" entityType="airport" initialValue={linkedEntity ?? undefined} />
       )}
       {mode === "route" && <EntityCompare key="route" entityType="route" />}
-      {mode === "aircraft" && (
-        <EntityCompare key="aircraft" entityType="aircraft" initialValue={linkedEntity ?? undefined} />
-      )}
-
       {mode === "carrier" && (
       <>
+      <section className="compare-scenarios-block" aria-labelledby="compare-scenarios-title">
+      <div className="compare-scenarios-heading"><div><p className="section-label">SET UP THE COMPARISON</p><h2 id="compare-scenarios-title">Choose periods to put side by side.</h2></div><span>{scenarios.length} periods · {totalRuns} result{totalRuns === 1 ? "" : "s"}</span></div>
       <div className="scenario-list">
         {scenarios.map((s, i) => (
-          <div key={s.id} className="scenario-card" style={{ borderTopColor: PALETTE[i % PALETTE.length] }}>
+          <div key={s.id} className={`scenario-card public-scenario-card public-scenario-${i % 3}`}>
             <div className="scenario-card-head">
               <input
                 className="scenario-label-input"
@@ -382,6 +380,9 @@ function ComparePageInner() {
           <p className="scenario-error">Fix the date range error above before comparing.</p>
         )}
       </div>
+      </section>
+
+      {!results && <p className="compare-start-note">Results appear here after you run the comparison. The same date and carrier choices are used for the summary and monthly trend.</p>}
 
       {results && (
         <>

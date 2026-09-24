@@ -6,6 +6,8 @@ import DateRangePreset from "../components/DateRangePreset";
 import CancellationCauseChart from "../components/CancellationCauseChart";
 import DistanceBucketChart from "../components/DistanceBucketChart";
 import { CARRIER_NAMES, carrierName } from "../lib/carriers";
+import { contextEndDate, contextStartDate, useResearchContext } from "../lib/research-context";
+import { ChartFrame } from "../components/product/ChartFrame";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8200";
 
@@ -33,6 +35,7 @@ type DistanceBucket = {
   avg_distance_miles: number;
 };
 type DistanceBucketResult = { buckets: DistanceBucket[] };
+type DelayFilters = { carrier: string; airport: string; startDate: string; endDate: string };
 
 const CARRIER_CODES = Object.keys(CARRIER_NAMES);
 
@@ -46,6 +49,7 @@ function buildQuery(params: Record<string, string>): string {
 }
 
 export default function DelaysPage() {
+  const { context, update, summary: contextSummary } = useResearchContext();
   const [overview, setOverview] = useState<{ causes: Cause[] } | null>(null);
   const [cancellationOverview, setCancellationOverview] = useState<CancellationResult | null>(null);
   const [distanceOverview, setDistanceOverview] = useState<DistanceBucketResult | null>(null);
@@ -86,14 +90,14 @@ export default function DelaysPage() {
       .catch(() => setAllAirports([]));
   }, []);
 
-  async function applyFilters() {
+  async function applyFilters(filters: DelayFilters) {
     setLoading(true);
     setNotFound(false);
     const qs = buildQuery({
-      carrier: carrierInput,
-      airport: airportInput,
-      start_date: startDate,
-      end_date: endDate,
+      carrier: filters.carrier,
+      airport: filters.airport,
+      start_date: filters.startDate,
+      end_date: filters.endDate,
     });
     setCancellationNotFound(false);
     try {
@@ -136,7 +140,22 @@ export default function DelaysPage() {
     }
   }
 
+  useEffect(() => {
+    const scoped = {
+      carrier: context.carrier,
+      airport: context.airport,
+      startDate: contextStartDate(context.from),
+      endDate: contextEndDate(context.to),
+    };
+    setCarrierInput(scoped.carrier);
+    setAirportInput(scoped.airport);
+    setStartDate(scoped.startDate);
+    setEndDate(scoped.endDate);
+    if (Object.values(scoped).some(Boolean)) void applyFilters(scoped);
+  }, [context.airport, context.carrier, context.from, context.to]);
+
   const hasFilter = carrierInput || airportInput || startDate || endDate;
+  const selectedPeriod = startDate || endDate ? `${startDate || "earliest"} to ${endDate || "latest"}` : "Full local warehouse";
 
   return (
     <main className="page">
@@ -149,23 +168,13 @@ export default function DelaysPage() {
       </header>
 
       <section className="section">
-        <div className="section-head">
-          <h2 className="section-title">Share of delay-minutes by cause</h2>
-          <span className="section-note">All flights, full history</span>
-        </div>
-        <div className="screen">
+        <ChartFrame title="Share of delay-minutes by cause" interpretation="BTS-recorded cause minutes show which category accounts for the largest recorded share of delay time; they do not prove a root cause." evidence={{ source: "BTS Marketing Carrier On-Time Performance delay fields", period: "Full local warehouse", method: "Share of available recorded delay minutes", definition: "Each bar is a recorded cause category's share of total reported delay minutes.", caveat: "BTS cause categories are descriptive classifications, not a complete causal diagnosis." }}>
           {overview ? <DelayCauseChart data={overview.causes} /> : <p className="error-text">Loading...</p>}
-        </div>
+        </ChartFrame>
       </section>
 
       <section className="section">
-        <div className="section-head">
-          <h2 className="section-title">Why flights get cancelled</h2>
-          <span className="section-note">
-            Distinct from delay causes above &mdash; this covers flights that never ran at all
-          </span>
-        </div>
-        <div className="screen">
+        <ChartFrame title="Why flights get cancelled" interpretation="Cancellation codes describe flights that did not operate. They are separate from delay causes on completed flights." evidence={{ source: "BTS cancellation-code fields", period: "Full local warehouse", sample: cancellationOverview ? cancellationOverview.total_cancelled_flights.toLocaleString() : undefined, method: "Cancellation count aggregation", definition: "Each category is the BTS-coded reason for a cancelled flight.", caveat: "Classification practices and extraordinary periods can affect category shares." }}>
           {cancellationOverview ? (
             <>
               <p className="page-note" style={{ marginBottom: "1rem" }}>
@@ -213,15 +222,11 @@ export default function DelaysPage() {
           ) : (
             <p className="error-text">Loading...</p>
           )}
-        </div>
+        </ChartFrame>
       </section>
 
       <section className="section">
-        <div className="section-head">
-          <h2 className="section-title">Does flight length affect on-time performance?</h2>
-          <span className="section-note">Short/medium/long-haul, bucketed by scheduled distance &mdash; cancellation rate is where the real gap is</span>
-        </div>
-        <div className="screen">
+        <ChartFrame title="On-time performance by scheduled distance" interpretation="Distance groups make reliability differences visible by scheduled length, but they mix routes, airports, weather, and carrier schedules." evidence={{ source: "BTS Marketing Carrier On-Time Performance", period: "Full local warehouse", sample: distanceOverview ? distanceOverview.buckets.reduce((total, item) => total + item.total_flights, 0).toLocaleString() : undefined, method: "Scheduled-distance bucket aggregation", definition: "Short-haul is under 500 miles, medium-haul is 500–1,500 miles, and long-haul is over 1,500 miles.", caveat: "Distance is an association and does not isolate the operational reason for any performance gap." }}>
           {distanceOverview ? (
             <>
               <p className="page-note" style={{ marginBottom: "1rem" }}>
@@ -266,7 +271,7 @@ export default function DelaysPage() {
           ) : (
             <p className="error-text">Loading...</p>
           )}
-        </div>
+        </ChartFrame>
       </section>
 
       <section className="section">
@@ -277,7 +282,7 @@ export default function DelaysPage() {
           <div className="route-lookup-row">
             <label className="filter-field">
               <span className="filter-label">Carrier</span>
-              <select value={carrierInput} onChange={(e) => setCarrierInput(e.target.value)}>
+              <select value={carrierInput} onChange={(e) => { setCarrierInput(e.target.value); update({ carrier: e.target.value }); }}>
                 <option value="">All carriers</option>
                 {CARRIER_CODES.map((code) => (
                   <option key={code} value={code}>
@@ -288,7 +293,7 @@ export default function DelaysPage() {
             </label>
             <label className="filter-field">
               <span className="filter-label">Airport</span>
-              <select value={airportInput} onChange={(e) => setAirportInput(e.target.value)}>
+              <select value={airportInput} onChange={(e) => { setAirportInput(e.target.value); update({ airport: e.target.value }); }}>
                 <option value="">All airports</option>
                 {allAirports.map((a) => (
                   <option key={a} value={a}>{a}</option>
@@ -298,17 +303,18 @@ export default function DelaysPage() {
             <DateRangePreset
               startDate={startDate}
               endDate={endDate}
-              onChange={(start, end) => { setStartDate(start); setEndDate(end); }}
+              onChange={(start, end) => { setStartDate(start); setEndDate(end); update({ from: start, to: end }); }}
             />
             <button
               type="button"
               className="compare-run"
-              onClick={applyFilters}
+              onClick={() => void applyFilters({ carrier: carrierInput, airport: airportInput, startDate, endDate })}
               disabled={!hasFilter || loading}
             >
               {loading ? "Applying..." : "Apply"}
             </button>
           </div>
+          <p className="research-scope-note"><strong>URL scope:</strong> {contextSummary}. {context.route ? "Route direction stays visible in the shared context, but BTS delay-cause aggregates here are carrier/airport/date filters rather than route-specific causes." : "Changing the shared context reruns these carrier, airport, and date aggregates."}</p>
 
           {notFound && !loading && (
             <p className="error-text" style={{ marginTop: "1rem" }}>No flights matched that filter.</p>
@@ -324,22 +330,18 @@ export default function DelaysPage() {
                   tone="rust"
                 />
               </div>
-              <div style={{ marginTop: "1.5rem" }}>
-                <p className="eyebrow" style={{ marginBottom: "0.75rem" }}>Delay causes in this scope</p>
+              <ChartFrame title="Delay causes in the active scope" interpretation="The chart updates from the carrier, airport, and date values in the shared research URL." evidence={{ source: "BTS Marketing Carrier On-Time Performance delay fields", period: selectedPeriod, sample: result.total_flights.toLocaleString(), method: "Filtered cause-minute aggregation", caveat: "A route value in the shared context is retained for the investigation but is not applied here because this BTS cause endpoint is carrier/airport/date-grained." }} className="scoped-chart-frame">
                 <DelayCauseChart data={result.causes} />
-              </div>
+              </ChartFrame>
 
               {cancellationResult && !cancellationNotFound && (
-                <div style={{ marginTop: "2rem" }}>
-                  <p className="eyebrow" style={{ marginBottom: "0.75rem" }}>
-                    Cancellation causes in this scope
-                  </p>
+                <ChartFrame title="Cancellation causes in the active scope" interpretation="The categories describe why flights in this carrier, airport, and period scope did not operate." evidence={{ source: "BTS cancellation-code fields", period: selectedPeriod, sample: cancellationResult.total_cancelled_flights.toLocaleString(), method: "Filtered cancellation count aggregation", caveat: "Cancellation-code shares can be affected by reporting conventions and exceptional periods." }} className="scoped-chart-frame">
                   <p className="page-note" style={{ marginBottom: "1rem" }}>
                     {cancellationResult.total_cancelled_flights.toLocaleString()} cancelled flights in scope,{" "}
                     {cancellationResult.coded_cancelled_flights.toLocaleString()} with a coded reason
                   </p>
                   <CancellationCauseChart data={cancellationResult.causes} />
-                </div>
+                </ChartFrame>
               )}
               {cancellationNotFound && (
                 <p className="page-note" style={{ marginTop: "1.5rem" }}>
@@ -348,12 +350,9 @@ export default function DelaysPage() {
               )}
 
               {distanceResult && !distanceNotFound && (
-                <div style={{ marginTop: "2rem" }}>
-                  <p className="eyebrow" style={{ marginBottom: "0.75rem" }}>
-                    Haul-length breakdown in this scope
-                  </p>
+                <ChartFrame title="Haul-length breakdown in the active scope" interpretation="This keeps the active carrier, airport, and date scope while grouping the resulting records by scheduled distance." evidence={{ source: "BTS Marketing Carrier On-Time Performance", period: selectedPeriod, sample: distanceResult.buckets.reduce((total, item) => total + item.total_flights, 0).toLocaleString(), method: "Filtered scheduled-distance bucket aggregation", caveat: "Distance groups still combine multiple routes and operational conditions." }} className="scoped-chart-frame">
                   <DistanceBucketChart data={distanceResult.buckets} />
-                </div>
+                </ChartFrame>
               )}
               {distanceNotFound && (
                 <p className="page-note" style={{ marginTop: "1.5rem" }}>

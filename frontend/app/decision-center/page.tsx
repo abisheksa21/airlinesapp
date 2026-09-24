@@ -28,6 +28,7 @@ import {
   TURNAROUND_ROWS,
 } from "./constants";
 import { useMode } from "../lib/mode";
+import { useResearchContext } from "../lib/research-context";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8200";
 
@@ -111,6 +112,7 @@ function deriveRankingVerdict(result: RankingResult): string | null {
 
 export default function DecisionCenterPage() {
   const { mode, setMode } = useMode();
+  const { context, update, summary: contextSummary } = useResearchContext();
   const [tab, setTab] = useState<DecisionTab>("levers");
   const [carrierInput, setCarrierInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -146,6 +148,9 @@ export default function DecisionCenterPage() {
   const [portfolioMetric, setPortfolioMetric] = useState("severe_delay_exposure");
   const [portfolioCostModel, setPortfolioCostModel] = useState("unit");
   const [portfolioResult, setPortfolioResult] = useState<any>(null);
+  const [portfolioValidation, setPortfolioValidation] = useState<any>(null);
+  const [portfolioValidationLoading, setPortfolioValidationLoading] = useState(false);
+  const [portfolioValidationError, setPortfolioValidationError] = useState("");
 
   const [resilienceMinFlights, setResilienceMinFlights] = useState(50);
   const [resilienceResult, setResilienceResult] = useState<NetworkResilienceResult | null>(null);
@@ -161,6 +166,15 @@ export default function DecisionCenterPage() {
     }
   }, [riskEntityType, airportOptions.length, tab]);
 
+  useEffect(() => {
+    setCarrierInput(context.carrier);
+    setBankCarrier(context.carrier);
+    setCapacityCarrier(context.carrier);
+    setBankAirport(context.airport);
+    if (riskEntityType === "carrier") setRiskEntity(context.carrier);
+    if (riskEntityType === "airport") setRiskEntity(context.airport);
+  }, [context.airport, context.carrier, riskEntityType]);
+
   function resetResults() {
     setLeverResult(null);
     setScenarioResult(null);
@@ -171,6 +185,8 @@ export default function DecisionCenterPage() {
     setBankValidation(null);
     setBankValidationError("");
     setPortfolioResult(null);
+    setPortfolioValidation(null);
+    setPortfolioValidationError("");
     setResilienceResult(null);
     setCapacityResult(null);
     setNotFound(false);
@@ -220,6 +236,8 @@ export default function DecisionCenterPage() {
         if (!res.ok) throw new Error("not ok");
         setBankResult(await res.json());
       } else if (tab === "portfolio") {
+        setPortfolioValidation(null);
+        setPortfolioValidationError("");
         const params = new URLSearchParams({
           candidate_type: portfolioType, budget: String(portfolioBudgetInput), primary_metric: portfolioMetric,
           cost_model: portfolioCostModel,
@@ -234,6 +252,10 @@ export default function DecisionCenterPage() {
       } else if (tab === "capacity") {
         const params = new URLSearchParams({ limit: "30", minimum_flights: "100" });
         if (capacityCarrier) params.set("carrier", capacityCarrier);
+        const scopedRoute = context.route.match(/^([A-Z]{3})\s*(?:→|->|-)\s*([A-Z]{3})$/i);
+        if (scopedRoute) { params.set("origin", scopedRoute[1].toUpperCase()); params.set("dest", scopedRoute[2].toUpperCase()); }
+        if (/^\d{4}-\d{2}$/.test(context.from)) params.set("from_month", context.from);
+        if (/^\d{4}-\d{2}$/.test(context.to)) params.set("to_month", context.to);
         const res = await fetch(`${API_BASE}/api/capacity/correlation?${params}`);
         if (!res.ok) throw new Error("not ok");
         setCapacityResult(await res.json());
@@ -278,6 +300,32 @@ export default function DecisionCenterPage() {
       setBankValidationError(cause instanceof Error ? cause.message : "The historical stability check could not run.");
     } finally {
       setBankValidationLoading(false);
+    }
+  }
+
+  async function validatePortfolioHistory() {
+    if (!portfolioResult) return;
+    setPortfolioValidationLoading(true);
+    setPortfolioValidationError("");
+    try {
+      const params = new URLSearchParams({
+        candidate_type: portfolioType,
+        budget: String(portfolioBudgetInput),
+        primary_metric: portfolioMetric,
+        cost_model: portfolioCostModel,
+        maximum_windows: "3",
+        reference_months: "12",
+        outcome_horizon_months: "3",
+      });
+      const response = await fetch(`${API_BASE}/api/decision/network-protection-validation?${params}`);
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail ?? "The historical portfolio replay could not run.");
+      setPortfolioValidation(payload);
+    } catch (cause) {
+      setPortfolioValidation(null);
+      setPortfolioValidationError(cause instanceof Error ? cause.message : "The historical portfolio replay could not run.");
+    } finally {
+      setPortfolioValidationLoading(false);
     }
   }
 
@@ -556,7 +604,7 @@ export default function DecisionCenterPage() {
             <div className="route-lookup-row">
               <label className="filter-field">
                 <span className="filter-label">Carrier</span>
-                <select value={carrierInput} onChange={(e) => setCarrierInput(e.target.value)}>
+                <select value={carrierInput} onChange={(e) => { setCarrierInput(e.target.value); update({ carrier: e.target.value }); }}>
                   <option value="">Select carrier</option>
                   {CARRIER_CODES.map((code) => (
                     <option key={code} value={code}>{code} &mdash; {carrierName(code)}</option>
@@ -589,7 +637,7 @@ export default function DecisionCenterPage() {
                 <span className="filter-label">Who to check</span>
                 <select
                   value={riskEntityType}
-                  onChange={(e) => { setRiskEntityType(e.target.value as "carrier" | "airport"); setRiskEntity(""); }}
+                  onChange={(e) => { const nextType = e.target.value as "carrier" | "airport"; setRiskEntityType(nextType); setRiskEntity(nextType === "carrier" ? context.carrier : context.airport); }}
                 >
                   <option value="carrier">Carrier</option>
                   <option value="airport">Airport</option>
@@ -597,7 +645,7 @@ export default function DecisionCenterPage() {
               </label>
               <label className="filter-field">
                 <span className="filter-label">{riskEntityType === "carrier" ? "Choose an airline" : "Choose an airport"}</span>
-                <select value={riskEntity} onChange={(e) => setRiskEntity(e.target.value)}>
+                <select value={riskEntity} onChange={(e) => { setRiskEntity(e.target.value); update(riskEntityType === "carrier" ? { carrier: e.target.value } : { airport: e.target.value }); }}>
                   <option value="">Select one</option>
                   {riskEntityType === "carrier"
                     ? CARRIER_CODES.map((code) => (
@@ -621,14 +669,14 @@ export default function DecisionCenterPage() {
             <div className="route-lookup-row" style={{ flexWrap: "wrap" }}>
               <label className="filter-field">
                 <span className="filter-label">Airport</span>
-                <select value={bankAirport} onChange={(e) => setBankAirport(e.target.value)}>
+                <select value={bankAirport} onChange={(e) => { setBankAirport(e.target.value); update({ airport: e.target.value }); }}>
                   <option value="">Select airport</option>
                   {airportOptions.map((code) => <option key={code} value={code}>{code}</option>)}
                 </select>
               </label>
               <label className="filter-field">
                 <span className="filter-label">Airline (optional)</span>
-                <select value={bankCarrier} onChange={(e) => setBankCarrier(e.target.value)}>
+                <select value={bankCarrier} onChange={(e) => { setBankCarrier(e.target.value); update({ carrier: e.target.value }); }}>
                   <option value="">All carriers</option>
                   {CARRIER_CODES.map((code) => (
                     <option key={code} value={code}>{code} &mdash; {carrierName(code)}</option>
@@ -750,7 +798,7 @@ export default function DecisionCenterPage() {
             <div className="route-lookup-row">
               <label className="filter-field">
                 <span className="filter-label">Airline (optional)</span>
-                <select value={capacityCarrier} onChange={(e) => setCapacityCarrier(e.target.value)}>
+                <select value={capacityCarrier} onChange={(e) => { setCapacityCarrier(e.target.value); update({ carrier: e.target.value }); }}>
                   <option value="">All carriers</option>
                   {CARRIER_CODES.map((code) => (
                     <option key={code} value={code}>{code} &mdash; {carrierName(code)}</option>
@@ -773,6 +821,7 @@ export default function DecisionCenterPage() {
           <p className="decision-tab-type">
             <span>{TAB_HELP[tab].kind}</span> {TAB_HELP[tab].result}
           </p>
+          <p className="research-scope-note"><strong>Shared context:</strong> {contextSummary}. Carrier and airport selections populate the compatible decision tools. Route and monthly period scope are applied to the T-100 comparison; other decision experiments disclose their own required scope instead of silently pretending to use filters they do not support.</p>
 
           {notFound && <p className="error-text" style={{ marginTop: "1rem" }}>No matching flights found for that carrier.</p>}
           {error && <p className="error-text" style={{ marginTop: "1rem" }}>Could not reach the API.</p>}
@@ -1187,6 +1236,38 @@ export default function DecisionCenterPage() {
                 objective to see a different feasible shortlist.</>
               )}
             </div>
+
+            <div className="bank-validation-panel">
+              <div>
+                <p className="eyebrow">Historical priority check</p>
+                <strong>Did earlier focus lists still point to the same kind of exposure later?</strong>
+                <p className="page-note">The tool rebuilds the same portfolio from 12 earlier months, then compares its selected targets with the other candidates in three later, non-overlapping three-month windows. It checks whether the list stayed informative — not whether an intervention worked.</p>
+              </div>
+              <button type="button" className="secondary-action" onClick={() => void validatePortfolioHistory()} disabled={portfolioValidationLoading}>
+                {portfolioValidationLoading ? "Checking past periods…" : "Check past periods"}
+              </button>
+            </div>
+            {portfolioValidationError && <p className="page-note" style={{ color: "#ffc3bd" }}>{portfolioValidationError}</p>}
+            {portfolioValidation && (
+              <div className="bank-validation-results">
+                {portfolioValidation.status === "ready" ? (
+                  <>
+                    <div className="board board-compact">
+                      <Tile label="Past windows checked" value={`${portfolioValidation.summary.windows_evaluated} of ${portfolioValidation.summary.windows_requested}`} />
+                      <Tile label="Windows selected above others" value={String(portfolioValidation.summary.windows_with_positive_selection_lift)} />
+                      <Tile label="Median later advantage" value={portfolioValidation.summary.median_selection_lift == null ? "—" : String(portfolioValidation.summary.median_selection_lift)} />
+                      <Tile label="Median top-list hit rate" value={portfolioValidation.summary.median_top_k_hit_rate == null ? "—" : formatPercent(portfolioValidation.summary.median_top_k_hit_rate)} />
+                    </div>
+                    <table className="compare-table">
+                      <thead><tr><th>Earlier reference</th><th>Later window</th><th>Selected then</th><th>Selected later</th><th>Later advantage</th><th>Top-list hits</th></tr></thead>
+                      <tbody>{portfolioValidation.records.filter((record: any) => record.status === "ready").map((record: any) => <tr key={record.future_window}><td>{record.reference_window}</td><td>{record.future_window}</td><td>{record.selected_ids.join(", ")}</td><td>{record.selected_future_metric_mean}</td><td>{record.selection_lift == null ? "—" : record.selection_lift}</td><td>{record.top_k_hits} / {record.top_k}</td></tr>)}</tbody>
+                    </table>
+                    {portfolioValidation.records.some((record: any) => record.status !== "ready") && <p className="page-note" style={{ marginTop: "0.75rem" }}>Some earlier windows were skipped because their candidate or later outcome history was too thin.</p>}
+                    <p className="page-note" style={{ marginTop: "0.75rem" }}>{portfolioValidation.methodology.not_claimed}</p>
+                  </>
+                ) : <p className="page-note">{portfolioValidation.reason ?? portfolioValidation.methodology?.not_claimed ?? "There was not enough prior history for this replay."}</p>}
+              </div>
+            )}
 
             <div style={{ marginTop: "1.5rem" }}>
               <p className="eyebrow" style={{ marginBottom: "0.75rem" }}>Suggested focus areas</p>

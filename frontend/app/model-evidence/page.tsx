@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useState } from "react";
 import { useMode } from "../lib/mode";
+import { useResearchContext } from "../lib/research-context";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8200";
 
@@ -16,6 +17,15 @@ type Metrics = {
 };
 
 type Method = { id: string; label: string; feature_names: string[] };
+
+type BaselineComparison = {
+  aggregate_mae_change_vs_baseline: number | null;
+  relative_mae_improvement_vs_baseline: number | null;
+  windows_better_than_baseline: number;
+  windows_worse_than_baseline: number;
+  windows_tied_with_baseline: number;
+  status: "supported_candidate" | "keep_exploratory";
+};
 
 type Evidence = {
   status: "ready" | "unavailable" | "insufficient_history";
@@ -40,8 +50,10 @@ type Evidence = {
     test_horizon_months: number;
     minimum_training_periods: number;
     minimum_training_examples: number;
+    test_windows_do_not_overlap: boolean;
     aggregate: Record<string, Metrics>;
     winner_counts_by_target: Record<string, Record<string, number>>;
+    comparison_to_historical_baseline: Record<string, Record<string, BaselineComparison>>;
     windows: Array<{
       training_through: string;
       test_start: string;
@@ -75,8 +87,17 @@ function labelForWinner(methods: Method[], wins: Record<string, number> | undefi
   return methods.filter((method) => (wins[method.id] ?? 0) === best).map((method) => method.label).join(" / ");
 }
 
+function promotionRead(methods: Method[], comparisons: Record<string, BaselineComparison> | undefined): string {
+  if (!comparisons) return "No comparison available";
+  const supported = methods.filter((method) => comparisons[method.id]?.status === "supported_candidate");
+  if (supported.length) return `${supported.map((method) => method.label).join(" / ")} has repeatable support`;
+  const checked = methods.filter((method) => method.id !== "math_baseline" && comparisons[method.id]);
+  return checked.length ? "Keep added models exploratory" : "No added model available";
+}
+
 export default function ModelEvidencePage() {
   const { mode, setMode } = useMode();
+  const { summary: contextSummary } = useResearchContext();
   const [evidence, setEvidence] = useState<Evidence | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -127,6 +148,7 @@ export default function ModelEvidencePage() {
         <div><p className="eyebrow">What this page answers</p><h2>Do the added data sources predict a later route-month more accurately?</h2></div>
         <p>A lower error across repeated future windows is useful evidence. It is still not proof that traffic, weather-coded delays, NAS-coded delays, or airport concentration caused an outcome.</p>
       </section>
+      <p className="research-scope-note"><strong>Shared context:</strong> {contextSummary}. This repeated validation deliberately stays at its declared route-panel sample rather than silently filtering to a tiny carrier, airport, or route subset. Its purpose is to judge methods over independent future windows; open a scoped forecast or capacity analysis when the question is about one object.</p>
 
       <section className="screen model-evidence-run-panel">
         <div><p className="eyebrow">Run the evidence check</p><h2 className="section-title">Four rolling future-month tests</h2><p className="page-note">The first run may take a little while because it fits several compact models over several independent time windows. Later visits reuse the six-hour local cache.</p></div>
@@ -142,7 +164,7 @@ export default function ModelEvidencePage() {
           <section className="section">
             <div className="section-head"><div><p className="eyebrow">01 · Evidence scope</p><h2 className="section-title">What was actually checked</h2></div><span className="section-note">{evidence.cache?.status === "hit" ? "cached local evidence" : "freshly rebuilt"}</span></div>
             <div className="board model-evidence-board"><MetricTile label="Route-month examples" value={evidence.data.route_month_examples.toLocaleString()} /><MetricTile label="Routes sampled" value={evidence.data.routes.toLocaleString()} /><MetricTile label="T-100 coverage" value={formatPercent(evidence.data.t100_context_share)} tone="signal" /><MetricTile label="Operation-driver coverage" value={formatPercent(evidence.data.operational_context_share)} tone="signal" /></div>
-            <div className="model-evidence-scope-strip"><span>Outcomes: {evidence.data.earliest_outcome_month} → {evidence.data.latest_outcome_month}</span><span>{evidence.data.routes.toLocaleString()} deterministic routes from {evidence.data.network_routes_available.toLocaleString()} available</span><span>{evaluation.window_count} later windows · {evaluation.test_horizon_months} months each</span><span>At least {evaluation.minimum_training_periods} periods and {evaluation.minimum_training_examples.toLocaleString()} earlier examples before each fit</span></div>
+            <div className="model-evidence-scope-strip"><span>Outcomes: {evidence.data.earliest_outcome_month} → {evidence.data.latest_outcome_month}</span><span>{evidence.data.routes.toLocaleString()} deterministic routes from {evidence.data.network_routes_available.toLocaleString()} available</span><span>{evaluation.window_count} non-overlapping later windows · {evaluation.test_horizon_months} months each</span><span>At least {evaluation.minimum_training_periods} periods and {evaluation.minimum_training_examples.toLocaleString()} earlier examples before each fit</span></div>
             <p className="page-note model-evidence-sampling-note">Sampling note: {evidence.data.route_sampling}</p>
           </section>
 
@@ -150,6 +172,7 @@ export default function ModelEvidencePage() {
             <div className="section-head"><div><p className="eyebrow">02 · Compare methods</p><h2 className="section-title">Average error on months held back from training</h2></div><span className="section-note">Lower MAE is better</span></div>
             <div className="screen table-screen"><div className="table-scroll"><table className="compare-table model-evidence-table"><thead><tr><th>Method</th><th>Arrival-delay MAE</th><th>Late-rate MAE</th><th>Cancellation MAE</th><th>Examples</th></tr></thead><tbody>{methods.map((method) => { const metrics = evaluation.aggregate[method.id]; return <tr key={method.id}><td><strong>{method.label}</strong></td><td>{formatMetric(metrics?.delay_minutes_mae, 2)} min</td><td>{formatMetric(metrics?.late_rate_mae, 3)}</td><td>{formatMetric(metrics?.cancellation_rate_mae, 3)}</td><td>{metrics?.examples.toLocaleString() ?? "—"}</td></tr>; })}</tbody></table></div></div>
             <div className="model-evidence-winner-grid">{TARGETS.map((target) => <div key={target.key}><span>{target.label}</span><strong>{labelForWinner(methods, evaluation.winner_counts_by_target[target.key])}</strong><small>Most window-level MAE wins</small></div>)}</div>
+            <div className="model-evidence-winner-grid">{TARGETS.map((target) => <div key={`${target.key}-promotion`}><span>{target.label}</span><strong>{promotionRead(methods, evaluation.comparison_to_historical_baseline[target.key])}</strong><small>Requires lower aggregate MAE and more future-window wins than losses versus the historical baseline.</small></div>)}</div>
           </section>
 
           <section className="section">

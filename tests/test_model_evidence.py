@@ -93,6 +93,18 @@ def test_model_evidence_uses_strictly_lagged_t100_and_operational_context():
     method_ids = {method["id"] for method in result["methods"]}
     assert {"math_baseline", "otp_history", "otp_t100", "otp_t100_operations"}.issubset(method_ids)
     assert len(result["evaluation"]["windows"]) == 3
+    assert result["evaluation"]["test_windows_do_not_overlap"] is True
+    test_starts = [window["test_start"] for window in result["evaluation"]["windows"]]
+    assert test_starts == sorted(test_starts)
+    assert all(
+        (int(later[:4]) * 12 + int(later[5:])) - (int(earlier[:4]) * 12 + int(earlier[5:])) >= 3
+        for earlier, later in zip(test_starts, test_starts[1:])
+    )
     for window in result["evaluation"]["windows"]:
         assert window["training_through"] < window["test_start"]
         assert "otp_t100_operations" in window["metrics"]
+    comparison = result["evaluation"]["comparison_to_historical_baseline"]
+    assert "otp_t100" in comparison["delay_minutes"]
+    assert comparison["delay_minutes"]["otp_t100"]["status"] in {
+        "supported_candidate", "keep_exploratory",
+    }

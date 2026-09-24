@@ -108,6 +108,24 @@ Health Score =
 
 Those five weights sum to exactly 1.0, so the Health Score itself always lands between 0 and 100.
 
+## Uncertainty and sample size
+
+Profiles also show an approximate 95% interval around the score. For each
+component, the standard error is estimated as `√(variance / sample size)`, then
+scaled by that component's formula. The five weighted errors are combined as:
+
+```text
+SE(score) = √Σ[(weight × component standard error)²]
+95% interval = score ± 1.96 × SE(score)
+```
+
+On-time rate, severe-delay rate, and average arrival delay use completed
+flights; cancellation and diversion rates use all scheduled flight records.
+This quick calculation treats component errors as independent even though
+they come from overlapping flights, so the interval is an approximation, not
+a full joint uncertainty model. A profile with fewer than 30 flight records
+is explicitly marked as a limited sample.
+
 ## Where the weights came from (the calibration method, in full)
 
 1. **Split each route's history in two, by date.** Using the full 2018–present dataset, we found the midpoint that put roughly 70% of each route's flights in an "early" period and 30% in a "late" period.
@@ -413,6 +431,22 @@ and solving again. This shows how much the optimized coverage would fall if
 that candidate were unavailable. It is a sensitivity result, not an estimate
 of the operational benefit of an intervention.
 
+### Historical priority replay
+
+The optional **Check past periods** control asks a narrower, testable question:
+did a portfolio chosen from earlier history still identify comparatively high
+exposure in later history? For each replay, it uses 12 earlier months to build
+the same candidate list, cost rule, and 0/1 optimization. It then holds those
+choices fixed and measures the selected and non-selected candidates in the
+following three months. The three later outcome windows do not overlap.
+
+The replay reports the selected list, its later average of the chosen metric,
+the average for non-selected candidates, and how many selected candidates were
+also in the later top list. A positive later difference is evidence that the
+priority list was stable for that metric. It does **not** observe an
+intervention, estimate a treatment effect, or show that allocating resources
+to the selected candidates would improve operations.
+
 ## Network Resilience Ranking
 
 The network is represented as a directed graph:
@@ -636,7 +670,9 @@ dataset remains auditable.
 The **Model evidence** page does not choose a single favorable train/test
 split. It creates several rolling checks. For each check, it trains only on
 route-month examples before a cutoff, then measures error on the following
-months. The next cutoff moves forward and repeats the same rule.
+months. The next cutoff moves forward and repeats the same rule. The later
+test windows do not overlap, so one future month cannot be counted as evidence
+for several separate checks.
 
 ```text
 earlier history  → fit model → later untouched months → record error
@@ -655,7 +691,10 @@ OTP + T-100 + operations   = above + prior WeatherDelay/NASDelay/airport concent
 
 The page shows every time window, the average MAE across them, coverage for
 each added source, and how often a method has the lowest error. It does not
-hide a window that makes a richer model look worse. Lower MAE supports
+hide a window that makes a richer model look worse. A richer candidate is only
+labelled as supported for an outcome when it has lower average MAE **and**
+wins more separate future windows than it loses against the transparent
+historical baseline. Otherwise it remains exploratory. Lower MAE supports
 predictive usefulness; it does not show that traffic, weather, NAS, or
 concentration caused a later delay or cancellation.
 

@@ -56,6 +56,29 @@ def profile_connection():
         ],
     )
     build_profile_summary_tables(connection)
+    # The fast public airport profile gets its top connections from the
+    # already-materialized route-month aggregate, never from a fresh scan of
+    # the raw flight table.
+    connection.execute(
+        """
+        CREATE TABLE analytics_route_month (
+            origin VARCHAR,
+            dest VARCHAR,
+            year_month VARCHAR,
+            total_flights BIGINT,
+            on_time_rate DOUBLE
+        )
+        """
+    )
+    connection.executemany(
+        "INSERT INTO analytics_route_month VALUES (?, ?, ?, ?, ?)",
+        [
+            ("ORD", "LAX", "2024-01", 20, 0.90),
+            ("ORD", "LAX", "2024-02", 10, 0.80),
+            ("LAX", "ORD", "2024-01", 8, 0.75),
+            ("ORD", "DFW", "2024-02", 5, 0.60),
+        ],
+    )
     yield connection
     connection.close()
 
@@ -77,3 +100,5 @@ def test_airport_public_profile_counts_an_airport_once_per_flight(profile_connec
     assert profile["total_flights"] == 3
     assert profile["on_time_rate"] == pytest.approx(0.5)
     assert [month["month"] for month in profile["months"]] == ["2024-01", "2024-02"]
+    assert profile["top_routes"][0]["route"] == "ORD → LAX"
+    assert profile["top_routes"][0]["total_flights"] == 30

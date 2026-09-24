@@ -1,12 +1,14 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { CARRIER_NAMES, carrierName } from "../lib/carriers";
 import { formatInteger, formatNumber, formatPercent } from "../lib/format";
 import type { CapacityCorrelationResult, CapacityTrendResult } from "../decision-center/types";
 import { useMode } from "../lib/mode";
+import { routeParts, useResearchContext } from "../lib/research-context";
 import CapacityTrendChart from "../components/CapacityTrendChart";
+import { ChartFrame } from "../components/product/ChartFrame";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8200";
 const CARRIER_CODES = Object.keys(CARRIER_NAMES);
@@ -39,6 +41,7 @@ function periodLabel(value: number | null): string {
 
 export default function CapacityPage() {
   const { mode, setMode } = useMode();
+  const { context, update, summary: contextSummary } = useResearchContext();
   const [carrier, setCarrier] = useState("");
   const [minimumFlights, setMinimumFlights] = useState("100");
   const [summary, setSummary] = useState<CapacitySummaryResult | null>(null);
@@ -50,6 +53,10 @@ export default function CapacityPage() {
   const [summaryError, setSummaryError] = useState("");
   const [error, setError] = useState("");
   const [trendError, setTrendError] = useState("");
+  const selectedRoute = useMemo(() => routeParts(context.route), [context.route]);
+  const activeCarrier = context.carrier || carrier;
+  const activeFromMonth = /^\d{4}-\d{2}$/.test(context.from) ? context.from : "";
+  const activeToMonth = /^\d{4}-\d{2}$/.test(context.to) ? context.to : "";
 
   async function load() {
     if (mode === "public") {
@@ -74,10 +81,18 @@ export default function CapacityPage() {
     setError("");
     setTrendError("");
     const params = new URLSearchParams({ limit: "30", minimum_flights: minimumFlights });
-    if (carrier) params.set("carrier", carrier);
+    if (activeCarrier) params.set("carrier", activeCarrier);
+    if (selectedRoute?.origin) params.set("origin", selectedRoute.origin);
+    if (selectedRoute?.dest) params.set("dest", selectedRoute.dest);
+    if (activeFromMonth) params.set("from_month", activeFromMonth);
+    if (activeToMonth) params.set("to_month", activeToMonth);
     try {
       const trendParams = new URLSearchParams({ minimum_flights: minimumFlights });
-      if (carrier) trendParams.set("carrier", carrier);
+      if (activeCarrier) trendParams.set("carrier", activeCarrier);
+      if (selectedRoute?.origin) trendParams.set("origin", selectedRoute.origin);
+      if (selectedRoute?.dest) trendParams.set("dest", selectedRoute.dest);
+      if (activeFromMonth) trendParams.set("from_month", activeFromMonth);
+      if (activeToMonth) trendParams.set("to_month", activeToMonth);
       const [comparisonResponse, trendResponse] = await Promise.all([
         fetch(`${API_BASE}/api/capacity/correlation?${params}`),
         fetch(`${API_BASE}/api/capacity/trend?${trendParams}`),
@@ -101,7 +116,7 @@ export default function CapacityPage() {
     }
   }
 
-  useEffect(() => { void load(); }, [mode]);
+  useEffect(() => { void load(); }, [mode, context.carrier, context.from, context.route, context.to]);
 
   if (mode === "public") {
     return (
@@ -174,7 +189,7 @@ export default function CapacityPage() {
         <div className="screen capacity-controls">
           <label className="filter-field capacity-carrier-field">
             <span className="filter-label">Airline (optional)</span>
-            <select value={carrier} onChange={(event) => setCarrier(event.target.value)}>
+            <select value={activeCarrier} onChange={(event) => { setCarrier(event.target.value); update({ carrier: event.target.value }); }}>
               <option value="">All carriers</option>
               {CARRIER_CODES.map((code) => <option key={code} value={code}>{code} — {carrierName(code)}</option>)}
             </select>
@@ -192,6 +207,7 @@ export default function CapacityPage() {
           <div><span>Source</span><strong>BTS on-time records + T-100</strong></div>
           <div><span>Unit of comparison</span><strong>Carrier · route · month</strong></div>
           <div><span>Current threshold</span><strong>{minimumFlights} OTP flights</strong></div>
+          <div><span>URL scope</span><strong>{contextSummary}</strong></div>
         </div>
       </section>
 
@@ -235,15 +251,13 @@ export default function CapacityPage() {
               </div>
               <span className="section-note">same matched history</span>
             </div>
-            <div className="screen capacity-trend-screen">
-              <p className="page-note capacity-trend-intro">
-                Two lines answer the practical question: how full were the matched routes, and how often were their flights on time?
-              </p>
+            <ChartFrame title="Matched traffic and on-time trend" interpretation="The two lines show how traffic context and historical on-time performance moved in the same matched route-month scope." evidence={{ source: "BTS T-100 Domestic Segment + BTS Marketing Carrier On-Time Performance", period: `${periodLabel(result.overview.first_period)} to ${periodLabel(result.overview.last_period)}`, sample: `${formatInteger(result.overview.matched_route_months)} matched route-months`, definition: "Load factor is passengers divided by available seats; on-time is arrival under 15 minutes late among completed flights.", method: "OTP is aggregated then matched to T-100 at carrier + route + month grain.", caveat: "The chart is an association in the active historical scope, not a causal explanation or capacity guarantee." }} className="capacity-trend-screen">
+              <p className="page-note capacity-trend-intro">Two lines answer the practical question: how full were the matched routes, and how often were their flights on time?</p>
               {trendLoading && <p className="page-note">Building the monthly view…</p>}
               {trendError && <p className="page-note">{trendError}</p>}
               {trend && trend.months.length > 0 && <CapacityTrendChart data={trend.months} />}
               {trend && trend.months.length === 0 && <p className="page-note">No monthly trend points met the selected threshold.</p>}
-            </div>
+            </ChartFrame>
           </section>
 
           <section className="section">

@@ -1,13 +1,16 @@
 from datetime import date, datetime, timedelta
+from calendar import monthrange
 from dateutil.relativedelta import relativedelta
+from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 import hashlib
 import json
 import os
 import threading
 import time
 
-from fastapi import FastAPI, HTTPException, Query, Depends
+from fastapi import Body, Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -33,6 +36,7 @@ from api.analytics import (
     route_hour_baseline,
     route_ranking,
 )
+from api.airport_coordinates import AIRPORT_COORDINATES, COORDINATE_SOURCE
 from api.route_forecast import build_route_forecast
 from api.route_ml_forecast import build_route_ml_forecast, build_route_panel_ml_forecast
 from api.model_evidence import build_route_panel_temporal_evidence
@@ -46,6 +50,9 @@ from api.optimization.backend import PublicBackend
 from api.optimization.departure_bank import BankFlight, solve_departure_bank
 from api.optimization.departure_bank_validation import validate_departure_bank_history
 from api.optimization.network_protection import InterventionCandidate, solve_portfolio
+from api.optimization.network_protection_validation import (
+    build_network_protection_temporal_validation,
+)
 from api.schemas import ChatRequest
 from api.security import require_pipeline_admin
 
@@ -76,6 +83,122 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Saved investigations are intentionally kept outside the DuckDB warehouse:
+# they are lightweight analyst bookmarks, not flight data.  A local server
+# file makes them available across browsers on the same workstation without
+# pretending that this unauthenticated, local application has team accounts.
+_default_investigations_path = (
+    Path(__file__).resolve().parents[1]
+    / "Data"
+    / "State"
+    / "research_investigations.json"
+)
+INVESTIGATIONS_PATH = Path(
+    os.getenv("AIRLINE_INVESTIGATIONS_PATH", str(_default_investigations_path))
+).expanduser()
+_investigations_lock = threading.Lock()
+
+
+def _read_investigations() -> list[dict]:
+    """Read durable local investigation bookmarks without failing the API.
+
+    The file is excluded with the project's Data/ directory, so personal
+    bookmarks never end up in Git.  Corrupt or manually edited files are
+    treated as an empty list rather than preventing analytical endpoints from
+    starting.
+    """
+    try:
+        with INVESTIGATIONS_PATH.open("r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [
+        item
+        for item in raw
+        if isinstance(item, dict)
+        and isinstance(item.get("id"), str)
+        and isinstance(item.get("href"), str)
+        and isinstance(item.get("label"), str)
+        and isinstance(item.get("saved_at"), str)
+    ]
+
+
+def _write_investigations(records: list[dict]) -> None:
+    INVESTIGATIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = INVESTIGATIONS_PATH.with_name(
+        f"{INVESTIGATIONS_PATH.name}.{uuid4().hex}.tmp"
+    )
+    try:
+        with temporary_path.open("w", encoding="utf-8") as handle:
+            json.dump(records, handle, indent=2, ensure_ascii=False)
+        os.replace(temporary_path, INVESTIGATIONS_PATH)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink(missing_ok=True)
+
+
+def _validated_investigation_payload(payload: dict) -> tuple[str, str]:
+    href = str(payload.get("href", "")).strip()
+    label = str(payload.get("label", "")).strip()
+    if not href.startswith("/research") or href.startswith("//") or len(href) > 2000:
+        raise HTTPException(
+            status_code=422,
+            detail="Saved investigation links must be a local researcher URL.",
+        )
+    if not label or len(label) > 160:
+        raise HTTPException(
+            status_code=422,
+            detail="Saved investigation labels must contain 1 to 160 characters.",
+        )
+    return href, label
+
+
+@app.get("/api/investigations")
+def list_investigations():
+    """Return local-server investigation bookmarks, newest first."""
+    with _investigations_lock:
+        records = _read_investigations()
+    records.sort(key=lambda item: item["saved_at"], reverse=True)
+    return {
+        "storage": "local server file",
+        "scope": "This unauthenticated local app instance",
+        "investigations": records[:50],
+    }
+
+
+@app.post("/api/investigations")
+def save_investigation(payload: dict = Body(...)):
+    """Create or refresh a durable bookmark to a URL-backed analysis scope."""
+    href, label = _validated_investigation_payload(payload)
+    saved_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    with _investigations_lock:
+        records = _read_investigations()
+        existing = next((item for item in records if item["href"] == href), None)
+        record = {
+            "id": existing["id"] if existing else uuid4().hex,
+            "href": href,
+            "label": label,
+            "saved_at": saved_at,
+        }
+        records = [item for item in records if item["href"] != href]
+        records.insert(0, record)
+        _write_investigations(records[:50])
+    return {"status": "saved", "investigation": record}
+
+
+@app.delete("/api/investigations/{investigation_id}")
+def delete_investigation(investigation_id: str):
+    """Remove one local-server investigation bookmark."""
+    with _investigations_lock:
+        records = _read_investigations()
+        remaining = [item for item in records if item["id"] != investigation_id]
+        if len(remaining) == len(records):
+            raise HTTPException(status_code=404, detail="Saved investigation not found.")
+        _write_investigations(remaining)
+    return {"status": "deleted", "id": investigation_id}
 
 # Guards against triggering /api/admin/check-for-updates twice at once --
 # pipeline/auto_update.py drives a real headless Chrome session and writes
@@ -448,6 +571,53 @@ def network_protection_portfolio_endpoint(
         "residual_exposure": result.residual_exposure,
         "methodology": result.methodology,
     }
+
+
+@app.get("/api/decision/network-protection-validation")
+def network_protection_validation_endpoint(
+    candidate_type: str = Query("carrier", description="'carrier' or 'airport'"),
+    budget: float = Query(3.0, ge=0, description="Same attention-resource budget used by the portfolio"),
+    primary_metric: str = Query("severe_delay_exposure"),
+    airport_candidate_limit: int = Query(30, ge=1, le=200),
+    cost_model: str = Query("unit", pattern="^(unit|flight_volume_millions|sqrt_flight_volume)$"),
+    cost_scale: float = Query(1.0, gt=0),
+    maximum_windows: int = Query(3, ge=1, le=5),
+    reference_months: int = Query(12, ge=3, le=36),
+    outcome_horizon_months: int = Query(3, ge=1, le=12),
+    refresh: bool = Query(False, description="Rebuild this cached historical replay."),
+):
+    """Check whether a portfolio's *priority list* is stable over time.
+
+    The same live portfolio formulation is replayed using earlier history,
+    then the selected candidates are compared against the non-selected
+    candidates in separate later windows.  This does not simulate an
+    intervention or make a causal impact claim.
+    """
+    valid_metrics = {"total_flights_millions", *_HEALTH_SCORE_WEIGHTS.keys()}
+    if candidate_type not in ("carrier", "airport"):
+        raise HTTPException(status_code=400, detail="candidate_type must be 'carrier' or 'airport'")
+    if primary_metric not in valid_metrics:
+        raise HTTPException(
+            status_code=400,
+            detail=f"primary_metric must be one of: {', '.join(sorted(valid_metrics))}",
+        )
+    try:
+        with open_readonly_connection() as connection:
+            return build_network_protection_temporal_validation(
+                connection,
+                candidate_type=candidate_type,
+                budget=budget,
+                primary_metric=primary_metric,
+                cost_model=cost_model,
+                cost_scale=cost_scale,
+                airport_candidate_limit=airport_candidate_limit,
+                maximum_windows=maximum_windows,
+                reference_months=reference_months,
+                outcome_horizon_months=outcome_horizon_months,
+                force=refresh,
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/decision/network-resilience")
@@ -862,6 +1032,435 @@ def summary_endpoint(
     if "error" in result:
         raise HTTPException(status_code=404, detail=result["error"])
     return result
+
+
+@app.get("/api/public/scope-summary")
+def public_scope_summary_endpoint(
+    kind: str = Query(..., pattern="^(carrier|airport|route)$"),
+    carrier: Optional[str] = Query(None),
+    airport: Optional[str] = Query(None),
+    origin: Optional[str] = Query(None),
+    dest: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+):
+    """Return selected-object performance for the public lookup controls.
+
+    Whole-calendar-month scopes read the compact profile tables. Partial-day
+    custom and holiday ranges use exact FlightDate filtering so the displayed
+    dates always describe the records actually counted.
+    """
+    kind = kind.lower()
+    carrier = carrier.upper() if carrier else None
+    airport = airport.upper() if airport else None
+    origin = origin.upper() if origin else None
+    dest = dest.upper() if dest else None
+    if kind == "carrier" and not carrier:
+        raise HTTPException(status_code=422, detail="Choose a carrier.")
+    if kind == "airport" and not airport:
+        raise HTTPException(status_code=422, detail="Choose an airport.")
+    if kind == "route" and (not origin or not dest):
+        raise HTTPException(status_code=422, detail="Choose both route airports.")
+
+    parsed_start = parsed_end = None
+    try:
+        parsed_start = date.fromisoformat(start_date) if start_date else None
+        parsed_end = date.fromisoformat(end_date) if end_date else None
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Dates must use YYYY-MM-DD format.") from exc
+    if bool(parsed_start) != bool(parsed_end):
+        raise HTTPException(status_code=422, detail="Choose both a start and end date for a custom range.")
+    if parsed_start and parsed_end and parsed_start > parsed_end:
+        raise HTTPException(status_code=422, detail="Start date must be on or before end date.")
+
+    # A compact monthly table answers all-time and calendar-month scopes
+    # exactly. Any partial month needs exact flight dates and uses the raw
+    # compact flight projection instead.
+    whole_month_scope = not parsed_start and not parsed_end
+    if parsed_start and parsed_end:
+        whole_month_scope = parsed_start.day == 1 and parsed_end.day == monthrange(parsed_end.year, parsed_end.month)[1]
+
+    table_by_kind = {
+        "carrier": ("analytics_carrier_month", "carrier", carrier),
+        "airport": ("analytics_airport_profile_month", "airport", airport),
+        "route": ("analytics_route_month", None, None),
+    }
+
+
+@app.get("/api/public/directory-scope")
+def public_directory_scope_endpoint(
+    kind: str = Query(..., pattern="^(carrier|airport|route)$"),
+    carrier: Optional[str] = Query(None),
+    airport: Optional[str] = Query(None),
+    origin: Optional[str] = Query(None),
+    dest: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=500),
+):
+    """Filter the public directory ranking itself by entity and period.
+
+    Full-history and complete-calendar-month ranges use compact monthly tables.
+    Partial months use exact FlightDate filtering so holiday/custom scopes are
+    not approximated by whole-month data.
+    """
+    kind = kind.lower()
+    carrier = carrier.upper() if carrier else None
+    airport = airport.upper() if airport else None
+    origin = origin.upper() if origin else None
+    dest = dest.upper() if dest else None
+
+    parsed_start = parsed_end = None
+    try:
+        parsed_start = date.fromisoformat(start_date) if start_date else None
+        parsed_end = date.fromisoformat(end_date) if end_date else None
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Dates must use YYYY-MM-DD format.") from exc
+    if bool(parsed_start) != bool(parsed_end):
+        raise HTTPException(status_code=422, detail="Choose both a start and end date for a custom range.")
+    if parsed_start and parsed_end and parsed_start > parsed_end:
+        raise HTTPException(status_code=422, detail="Start date must be on or before end date.")
+    if origin and dest and origin == dest:
+        raise HTTPException(status_code=422, detail="Origin and destination must be different airports.")
+
+    # Monthly summaries are exact whenever the selected range starts and ends
+    # on calendar-month boundaries. Any partial month is queried by flight date.
+    monthly_scope = not parsed_start and not parsed_end
+    if parsed_start and parsed_end:
+        monthly_scope = (
+            parsed_start.day == 1
+            and parsed_end.day == monthrange(parsed_end.year, parsed_end.month)[1]
+        )
+
+    table_by_kind = {
+        "carrier": ("analytics_carrier_month", "carrier"),
+        "airport": ("analytics_airport_profile_month", "airport"),
+        "route": ("analytics_route_month", "route"),
+    }
+    monthly_table, dimension = table_by_kind[kind]
+    rows = None
+    method = "exact flight dates"
+
+    with open_readonly_connection() as connection:
+        table_exists = connection.execute(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
+            [monthly_table],
+        ).fetchone()[0] > 0
+
+        if monthly_scope and table_exists:
+            conditions = []
+            parameters: list[object] = []
+            if kind == "carrier" and carrier:
+                conditions.append("carrier = ?")
+                parameters.append(carrier)
+            elif kind == "airport" and airport:
+                conditions.append("airport = ?")
+                parameters.append(airport)
+            else:
+                if kind == "route" and origin:
+                    conditions.append("origin = ?")
+                    parameters.append(origin)
+                if kind == "route" and dest:
+                    conditions.append("dest = ?")
+                    parameters.append(dest)
+            if parsed_start:
+                conditions.append("year_month >= ?")
+                parameters.append(parsed_start.strftime("%Y-%m"))
+            if parsed_end:
+                conditions.append("year_month <= ?")
+                parameters.append(parsed_end.strftime("%Y-%m"))
+            where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            if kind == "route":
+                select_sql = f"""
+                    SELECT origin, dest,
+                           SUM(total_flights) AS total_flights,
+                           SUM(completed_flights) AS completed_flights,
+                           SUM(completed_flights * on_time_rate) / NULLIF(SUM(completed_flights), 0) AS on_time_rate,
+                           SUM(completed_flights * avg_arrival_delay_minutes) / NULLIF(SUM(completed_flights), 0) AS avg_arrival_delay_minutes,
+                           SUM(total_flights * cancellation_rate) / NULLIF(SUM(total_flights), 0) AS cancellation_rate
+                    FROM analytics_route_month
+                    {where_sql}
+                    GROUP BY origin, dest
+                    ORDER BY total_flights DESC
+                    LIMIT ?
+                """
+            elif kind == "airport":
+                select_sql = f"""
+                    SELECT airport,
+                           SUM(total_flights) AS total_flights,
+                           SUM(completed_flights) AS completed_flights,
+                           SUM(completed_flights * on_time_rate) / NULLIF(SUM(completed_flights), 0) AS on_time_rate,
+                           SUM(completed_flights * avg_arrival_delay_minutes) / NULLIF(SUM(completed_flights), 0) AS avg_arrival_delay_minutes,
+                           SUM(total_flights * cancellation_rate) / NULLIF(SUM(total_flights), 0) AS cancellation_rate
+                    FROM analytics_airport_profile_month
+                    {where_sql}
+                    GROUP BY airport
+                    ORDER BY total_flights DESC
+                    LIMIT ?
+                """
+            else:
+                select_sql = f"""
+                    SELECT carrier,
+                           SUM(total_flights) AS total_flights,
+                           SUM(completed_flights) AS completed_flights,
+                           SUM(completed_flights * on_time_rate) / NULLIF(SUM(completed_flights), 0) AS on_time_rate,
+                           SUM(completed_flights * avg_arrival_delay_minutes) / NULLIF(SUM(completed_flights), 0) AS avg_arrival_delay_minutes,
+                           SUM(total_flights * cancellation_rate) / NULLIF(SUM(total_flights), 0) AS cancellation_rate
+                    FROM analytics_carrier_month
+                    {where_sql}
+                    GROUP BY carrier
+                    ORDER BY on_time_rate DESC NULLS LAST, total_flights DESC
+                    LIMIT ?
+                """
+            rows = connection.execute(select_sql, [*parameters, limit]).fetchall()
+            method = "compact monthly aggregates"
+
+        if rows is None:
+            flight_table = best_flight_table(
+                connection,
+                {"FlightDate", "Marketing_Airline_Network", "Origin", "Dest", "Cancelled", "Diverted", "ArrDelay", "ArrDel15"},
+            )
+            date_conditions = ["FlightDate IS NOT NULL"]
+            date_parameters: list[object] = []
+            if parsed_start:
+                date_conditions.append("FlightDate >= CAST(? AS DATE)")
+                date_parameters.append(start_date)
+            if parsed_end:
+                date_conditions.append("FlightDate <= CAST(? AS DATE)")
+                date_parameters.append(end_date)
+            if kind == "carrier":
+                date_conditions.append("Marketing_Airline_Network IS NOT NULL")
+                if carrier:
+                    date_conditions.append("Marketing_Airline_Network = ?")
+                    date_parameters.append(carrier)
+                group_column = "Marketing_Airline_Network"
+                select_dimension = "Marketing_Airline_Network AS carrier"
+                order_by = "on_time_rate DESC NULLS LAST, total_flights DESC"
+                base_where = " AND ".join(date_conditions)
+                raw_sql = f"""
+                    SELECT {select_dimension},
+                           COUNT(*) AS total_flights,
+                           COUNT(*) FILTER (WHERE {COMPLETED_FLIGHT_SQL}) AS completed_flights,
+                           AVG(CASE WHEN {COMPLETED_FLIGHT_SQL} THEN CASE WHEN {ON_TIME_FLAG_SQL} THEN 1.0 ELSE 0.0 END END) AS on_time_rate,
+                           AVG(CASE WHEN {COMPLETED_FLIGHT_SQL} THEN ArrDelay END) AS avg_arrival_delay_minutes,
+                           AVG(Cancelled * 1.0) AS cancellation_rate
+                    FROM {flight_table}
+                    WHERE {base_where}
+                    GROUP BY {group_column}
+                    ORDER BY {order_by}
+                    LIMIT ?
+                """
+                rows = connection.execute(raw_sql, [*date_parameters, limit]).fetchall()
+            elif kind == "route":
+                date_conditions.extend(["Origin IS NOT NULL", "Dest IS NOT NULL"])
+                if origin:
+                    date_conditions.append("Origin = ?")
+                    date_parameters.append(origin)
+                if dest:
+                    date_conditions.append("Dest = ?")
+                    date_parameters.append(dest)
+                raw_sql = f"""
+                    SELECT Origin AS origin, Dest AS dest,
+                           COUNT(*) AS total_flights,
+                           COUNT(*) FILTER (WHERE {COMPLETED_FLIGHT_SQL}) AS completed_flights,
+                           AVG(CASE WHEN {COMPLETED_FLIGHT_SQL} THEN CASE WHEN {ON_TIME_FLAG_SQL} THEN 1.0 ELSE 0.0 END END) AS on_time_rate,
+                           AVG(CASE WHEN {COMPLETED_FLIGHT_SQL} THEN ArrDelay END) AS avg_arrival_delay_minutes,
+                           AVG(Cancelled * 1.0) AS cancellation_rate
+                    FROM {flight_table}
+                    WHERE {' AND '.join(date_conditions)}
+                    GROUP BY Origin, Dest
+                    ORDER BY total_flights DESC
+                    LIMIT ?
+                """
+                rows = connection.execute(raw_sql, [*date_parameters, limit]).fetchall()
+            else:
+                # Count each flight once at each endpoint; a same-airport
+                # origin/destination record must not be double-counted.
+                date_conditions.extend(["(Origin IS NOT NULL OR Dest IS NOT NULL)"])
+                if airport:
+                    date_conditions.append("(Origin = ? OR Dest = ?)")
+                    date_parameters.extend([airport, airport])
+                base_where = " AND ".join(date_conditions)
+                airport_parameters = [*date_parameters]
+                event_filter = ""
+                if airport:
+                    event_filter = "WHERE airport = ?"
+                    airport_parameters.append(airport)
+                raw_sql = f"""
+                    WITH airport_events AS (
+                        SELECT Origin AS airport, FlightDate, Cancelled, Diverted, ArrDelay, ArrDel15
+                        FROM {flight_table}
+                        WHERE {base_where} AND Origin IS NOT NULL
+                        UNION ALL
+                        SELECT Dest AS airport, FlightDate, Cancelled, Diverted, ArrDelay, ArrDel15
+                        FROM {flight_table}
+                        WHERE {base_where} AND Dest IS NOT NULL AND Dest <> Origin
+                    )
+                    SELECT airport,
+                           COUNT(*) AS total_flights,
+                           COUNT(*) FILTER (WHERE {COMPLETED_FLIGHT_SQL}) AS completed_flights,
+                           AVG(CASE WHEN {COMPLETED_FLIGHT_SQL} THEN CASE WHEN {ON_TIME_FLAG_SQL} THEN 1.0 ELSE 0.0 END END) AS on_time_rate,
+                           AVG(CASE WHEN {COMPLETED_FLIGHT_SQL} THEN ArrDelay END) AS avg_arrival_delay_minutes,
+                           AVG(Cancelled * 1.0) AS cancellation_rate
+                    FROM airport_events
+                    {event_filter}
+                    GROUP BY airport
+                    ORDER BY total_flights DESC
+                    LIMIT ?
+                """
+                # The airport event source is read twice, so bind its date and
+                # optional airport filters for both endpoint branches.
+                branch_parameters = [*date_parameters, *date_parameters]
+                if airport:
+                    branch_parameters.append(airport)
+                rows = connection.execute(raw_sql, [*branch_parameters, limit]).fetchall()
+
+    if kind == "route":
+        normalized_rows = [
+            {"route": f"{row[0]} → {row[1]}", "total_flights": int(row[2]), "completed_flights": int(row[3] or 0), "on_time_rate": row[4], "avg_arrival_delay_minutes": row[5], "cancellation_rate": row[6]}
+            for row in rows
+        ]
+    elif kind == "airport":
+        normalized_rows = [
+            {"airport": row[0], "total_flights": int(row[1]), "completed_flights": int(row[2] or 0), "on_time_rate": row[3], "avg_arrival_delay_minutes": row[4], "cancellation_rate": row[5]}
+            for row in rows
+        ]
+    else:
+        normalized_rows = [
+            {"carrier": row[0], "total_flights": int(row[1]), "completed_flights": int(row[2] or 0), "on_time_rate": row[3], "avg_arrival_delay_minutes": row[4], "cancellation_rate": row[5]}
+            for row in rows
+        ]
+
+    return {
+        "kind": kind,
+        "rows": normalized_rows,
+        "start_date": start_date,
+        "end_date": end_date,
+        "scope_method": method,
+    }
+    table_name, key_column, key_value = table_by_kind[kind]
+    compact_result = None
+    with open_readonly_connection() as connection:
+        if whole_month_scope:
+            table_exists = connection.execute(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'main' AND table_name = ?",
+                [table_name],
+            ).fetchone()[0] > 0
+            if table_exists:
+                conditions = []
+                parameters: list[object] = []
+                if key_column:
+                    conditions.append(f"{key_column} = ?")
+                    parameters.append(key_value)
+                else:
+                    conditions.extend(["origin = ?", "dest = ?"])
+                    parameters.extend([origin, dest])
+                if parsed_start:
+                    conditions.append("year_month >= ?")
+                    parameters.append(parsed_start.strftime("%Y-%m"))
+                if parsed_end:
+                    conditions.append("year_month <= ?")
+                    parameters.append(parsed_end.strftime("%Y-%m"))
+                where_sql = " AND ".join(conditions)
+                totals = connection.execute(
+                    f"""
+                    SELECT
+                        SUM(total_flights),
+                        SUM(completed_flights),
+                        SUM(completed_flights * on_time_rate) / NULLIF(SUM(completed_flights), 0),
+                        SUM(completed_flights * avg_arrival_delay_minutes) / NULLIF(SUM(completed_flights), 0),
+                        SUM(total_flights * cancellation_rate) / NULLIF(SUM(total_flights), 0)
+                    FROM {table_name}
+                    WHERE {where_sql}
+                    """,
+                    parameters,
+                ).fetchone()
+                month_rows = connection.execute(
+                    f"""
+                    SELECT year_month, SUM(total_flights),
+                           SUM(completed_flights * on_time_rate) / NULLIF(SUM(completed_flights), 0)
+                    FROM {table_name}
+                    WHERE {where_sql}
+                    GROUP BY year_month
+                    ORDER BY year_month
+                    """,
+                    parameters,
+                ).fetchall()
+                if totals and totals[0]:
+                    compact_result = (totals, month_rows)
+
+        if compact_result is None:
+            flight_table = best_flight_table(
+                connection,
+                {"FlightDate", "Marketing_Airline_Network", "Origin", "Dest", "Cancelled", "ArrDelay", "ArrDel15"},
+            )
+            clauses = ["FlightDate IS NOT NULL"]
+            parameters = []
+            if kind == "carrier":
+                clauses.append("Marketing_Airline_Network = ?")
+                parameters.append(carrier)
+            elif kind == "airport":
+                clauses.append("(Origin = ? OR Dest = ?)")
+                parameters.extend([airport, airport])
+            else:
+                clauses.extend(["Origin = ?", "Dest = ?"])
+                parameters.extend([origin, dest])
+            if parsed_start:
+                clauses.append("FlightDate >= CAST(? AS DATE)")
+                parameters.append(start_date)
+            if parsed_end:
+                clauses.append("FlightDate <= CAST(? AS DATE)")
+                parameters.append(end_date)
+            where_sql = " AND ".join(clauses)
+            totals = connection.execute(
+                f"""
+                SELECT COUNT(*),
+                       COUNT(*) FILTER (WHERE Cancelled = 0 AND ArrDelay IS NOT NULL),
+                       AVG(CASE WHEN Cancelled = 0 AND ArrDelay IS NOT NULL
+                           THEN CASE WHEN ArrDel15 = 0 THEN 1.0 ELSE 0.0 END END),
+                       AVG(CASE WHEN Cancelled = 0 THEN ArrDelay END),
+                       AVG(Cancelled * 1.0)
+                FROM {flight_table}
+                WHERE {where_sql}
+                """,
+                parameters,
+            ).fetchone()
+            month_rows = connection.execute(
+                f"""
+                SELECT strftime(FlightDate, '%Y-%m'), COUNT(*),
+                       AVG(CASE WHEN Cancelled = 0 AND ArrDelay IS NOT NULL
+                           THEN CASE WHEN ArrDel15 = 0 THEN 1.0 ELSE 0.0 END END)
+                FROM {flight_table}
+                WHERE {where_sql}
+                GROUP BY 1
+                ORDER BY 1
+                """,
+                parameters,
+            ).fetchall()
+
+    if not totals or not totals[0]:
+        raise HTTPException(status_code=404, detail="No flights match this object and time scope.")
+    actual_start = start_date or (f"{month_rows[0][0]}-01" if month_rows else None)
+    if end_date:
+        actual_end = end_date
+    elif month_rows:
+        year, month = (int(part) for part in month_rows[-1][0].split("-"))
+        actual_end = f"{year:04d}-{month:02d}-{monthrange(year, month)[1]:02d}"
+    else:
+        actual_end = None
+    return {
+        "kind": kind,
+        "entity": carrier if kind == "carrier" else airport if kind == "airport" else f"{origin} → {dest}",
+        "total_flights": int(totals[0] or 0),
+        "completed_flights": int(totals[1] or 0),
+        "on_time_rate": totals[2],
+        "avg_arrival_delay_minutes": totals[3],
+        "cancellation_rate": totals[4],
+        "start_date": actual_start,
+        "end_date": actual_end,
+        "months": [{"month": str(row[0]), "total_flights": int(row[1]), "on_time_rate": row[2]} for row in month_rows],
+        "scope_method": "monthly aggregate" if compact_result is not None else "exact flight dates",
+    }
 
 
 @app.get("/api/trend")
@@ -2498,6 +3097,81 @@ def get_busiest_routes(limit: int = 15):
     }
 
 
+@app.get("/api/network-map")
+def get_network_map(limit: int = Query(36, ge=8, le=100)):
+    """Return a compact, real-coordinate route network for map views.
+
+    The endpoint reads the existing compact route aggregation whenever it is
+    present. The browser receives only selected aggregates and route lines
+    with two known airport coordinates, never raw flight records.
+    """
+    with open_readonly_connection() as connection:
+        summary = network_summary(connection)
+        ranked_routes = route_ranking(connection, limit * 4)
+        if ranked_routes is None:
+            rows = connection.execute(
+                """
+                SELECT
+                    Origin || ' → ' || Dest AS route,
+                    COUNT(*) AS total_flights,
+                    AVG(CASE WHEN Cancelled = 0 THEN CASE WHEN ArrDel15 = 0 THEN 1.0 ELSE 0.0 END END) AS on_time_rate
+                FROM flights
+                WHERE Origin IS NOT NULL AND Dest IS NOT NULL
+                GROUP BY Origin, Dest
+                ORDER BY total_flights DESC
+                LIMIT ?
+                """,
+                [limit * 4],
+            ).fetchall()
+            ranked_routes = [
+                {"route": row[0], "total_flights": int(row[1]), "on_time_rate": row[2]}
+                for row in rows
+            ]
+
+    edges: list[dict] = []
+    node_volume: dict[str, int] = {}
+    for record in ranked_routes:
+        origin, separator, dest = record["route"].partition(" → ")
+        if not separator or origin not in AIRPORT_COORDINATES or dest not in AIRPORT_COORDINATES:
+            continue
+        edges.append({
+            "origin": origin,
+            "dest": dest,
+            "total_flights": record["total_flights"],
+            "on_time_rate": record["on_time_rate"],
+        })
+        node_volume[origin] = node_volume.get(origin, 0) + record["total_flights"]
+        node_volume[dest] = node_volume.get(dest, 0) + record["total_flights"]
+        if len(edges) >= limit:
+            break
+
+    nodes = [
+        {
+            "airport": airport,
+            "latitude": AIRPORT_COORDINATES[airport][0],
+            "longitude": AIRPORT_COORDINATES[airport][1],
+            "total_flights": volume,
+        }
+        for airport, volume in sorted(node_volume.items(), key=lambda item: item[1], reverse=True)
+    ]
+    period = {
+        "start_date": summary["start_date"] if summary else None,
+        "end_date": summary["end_date"] if summary else None,
+    }
+    return {
+        "source": "BTS Marketing Carrier On-Time Performance, compact route aggregation",
+        "period": period,
+        "coordinate_source": COORDINATE_SOURCE,
+        "coverage": {
+            "routes_requested": limit,
+            "routes_mapped": len(edges),
+            "airports_mapped": len(nodes),
+        },
+        "nodes": nodes,
+        "edges": edges,
+    }
+
+
 @app.get("/api/airports/list")
 def list_all_airports():
     """Every distinct airport code that appears as an origin or destination,
@@ -3325,11 +3999,27 @@ def data_sources():
     }
 
 
+def _capacity_month_key(value: Optional[str], parameter_name: str) -> Optional[int]:
+    """Convert a URL month (YYYY-MM) into a comparable integer key."""
+    if value is None or not value.strip():
+        return None
+    parts = value.split("-")
+    try:
+        year, month = int(parts[0]), int(parts[1])
+    except (IndexError, ValueError):
+        raise HTTPException(status_code=422, detail=f"{parameter_name} must use YYYY-MM.")
+    if len(parts) != 2 or not (2010 <= year <= 2100 and 1 <= month <= 12):
+        raise HTTPException(status_code=422, detail=f"{parameter_name} must use YYYY-MM.")
+    return year * 100 + month
+
+
 @app.get("/api/capacity/summary")
 def capacity_summary(
     carrier: Optional[str] = Query(None),
     origin: Optional[str] = Query(None, min_length=3, max_length=3),
     dest: Optional[str] = Query(None, min_length=3, max_length=3),
+    from_month: Optional[str] = Query(None),
+    to_month: Optional[str] = Query(None),
     limit: int = Query(25, ge=1, le=100),
 ):
     """Return real BTS T-100 route-month capacity context when loaded.
@@ -3338,6 +4028,11 @@ def capacity_summary(
     common mistake of attaching a monthly passenger/seat total to every
     flight row and thereby multiplying the data.
     """
+    from_month_key = _capacity_month_key(from_month, "from_month")
+    to_month_key = _capacity_month_key(to_month, "to_month")
+    if from_month_key and to_month_key and from_month_key > to_month_key:
+        raise HTTPException(status_code=422, detail="from_month must be before or equal to to_month.")
+
     clauses = []
     params: list = []
     if carrier:
@@ -3349,6 +4044,12 @@ def capacity_summary(
     if dest:
         clauses.append("Dest = ?")
         params.append(dest.upper())
+    if from_month_key:
+        clauses.append("Year * 100 + Month >= ?")
+        params.append(from_month_key)
+    if to_month_key:
+        clauses.append("Year * 100 + Month <= ?")
+        params.append(to_month_key)
     where = "WHERE " + " AND ".join(clauses) if clauses else ""
 
     with open_readonly_connection() as connection:
@@ -3406,7 +4107,7 @@ def capacity_summary(
     return {
         "source": "BTS T-100 Domestic Segment",
         "grain": "carrier + route + month (aircraft/service-class rows aggregated)",
-        "filters": {"carrier": carrier, "origin": origin, "dest": dest},
+        "filters": {"carrier": carrier, "origin": origin, "dest": dest, "from_month": from_month, "to_month": to_month},
         "overview": {
             "route_month_rows": overview[0],
             "departures_scheduled": overview[1],
@@ -3449,6 +4150,10 @@ def capacity_summary(
 @app.get("/api/capacity/correlation")
 def capacity_correlation(
     carrier: Optional[str] = Query(None),
+    origin: Optional[str] = Query(None, min_length=3, max_length=3),
+    dest: Optional[str] = Query(None, min_length=3, max_length=3),
+    from_month: Optional[str] = Query(None),
+    to_month: Optional[str] = Query(None),
     limit: int = Query(30, ge=5, le=100),
     minimum_flights: int = Query(100, ge=1, le=10000),
 ):
@@ -3461,8 +4166,29 @@ def capacity_correlation(
     association, not a causal claim.
     """
     carrier_value = carrier.upper().strip() if isinstance(carrier, str) and carrier else None
+    origin_value = origin.upper().strip() if isinstance(origin, str) and origin else None
+    dest_value = dest.upper().strip() if isinstance(dest, str) and dest else None
+    from_month_key = _capacity_month_key(from_month, "from_month")
+    to_month_key = _capacity_month_key(to_month, "to_month")
+    if from_month_key and to_month_key and from_month_key > to_month_key:
+        raise HTTPException(status_code=422, detail="from_month must be before or equal to to_month.")
     carrier_clause = "AND Marketing_Airline_Network = ?" if carrier_value else ""
     t100_clause = "WHERE UniqueCarrier = ?" if carrier_value else ""
+    scope_clauses = []
+    scope_params: list = []
+    if origin_value:
+        scope_clauses.append("Origin = ?")
+        scope_params.append(origin_value)
+    if dest_value:
+        scope_clauses.append("Dest = ?")
+        scope_params.append(dest_value)
+    if from_month_key:
+        scope_clauses.append("Year * 100 + Month >= ?")
+        scope_params.append(from_month_key)
+    if to_month_key:
+        scope_clauses.append("Year * 100 + Month <= ?")
+        scope_params.append(to_month_key)
+    scope_where = f"WHERE {' AND '.join(scope_clauses)}" if scope_clauses else ""
     with open_readonly_connection() as connection:
         exists = connection.execute(
             """
@@ -3522,6 +4248,7 @@ def capacity_correlation(
                 {t100_clause}
             )
             SELECT * FROM matched
+            {scope_where}
         """
         params = [carrier_value, minimum_flights] if carrier_value else [minimum_flights]
         # The optional carrier predicate appears in the OTP CTE before the
@@ -3543,7 +4270,7 @@ def capacity_correlation(
                 MAX(Year * 100 + Month)
             FROM ({query}) matched
             """,
-            params,
+            [*params, *scope_params],
         ).fetchone()
         rows = connection.execute(
             f"""
@@ -3552,7 +4279,7 @@ def capacity_correlation(
             ORDER BY passengers DESC NULLS LAST, Year DESC, Month DESC
             LIMIT ?
             """,
-            [*params, limit],
+            [*params, *scope_params, limit],
         ).fetchall()
 
     row_keys = [
@@ -3565,7 +4292,7 @@ def capacity_correlation(
         "status": "ok" if overview[0] else "no_matching_route_months",
         "source": "BTS T-100 Domestic Segment + BTS Marketing Carrier On-Time Performance",
         "grain": "carrier + origin + destination + month",
-        "filters": {"carrier": carrier_value, "minimum_otp_flights": minimum_flights},
+        "filters": {"carrier": carrier_value, "origin": origin_value, "dest": dest_value, "from_month": from_month, "to_month": to_month, "minimum_otp_flights": minimum_flights},
         "overview": {
             "matched_route_months": overview[0],
             "average_load_factor": overview[1],
@@ -3590,6 +4317,10 @@ def capacity_correlation(
 @app.get("/api/capacity/trend")
 def capacity_trend(
     carrier: Optional[str] = Query(None),
+    origin: Optional[str] = Query(None, min_length=3, max_length=3),
+    dest: Optional[str] = Query(None, min_length=3, max_length=3),
+    from_month: Optional[str] = Query(None),
+    to_month: Optional[str] = Query(None),
     minimum_flights: int = Query(100, ge=1, le=10000),
 ):
     """Return a simple monthly T-100 + OTP trend at the matched grain.
@@ -3600,8 +4331,29 @@ def capacity_trend(
     so large routes do not get the same weight as tiny routes by accident.
     """
     carrier_value = carrier.upper().strip() if isinstance(carrier, str) and carrier else None
+    origin_value = origin.upper().strip() if isinstance(origin, str) and origin else None
+    dest_value = dest.upper().strip() if isinstance(dest, str) and dest else None
+    from_month_key = _capacity_month_key(from_month, "from_month")
+    to_month_key = _capacity_month_key(to_month, "to_month")
+    if from_month_key and to_month_key and from_month_key > to_month_key:
+        raise HTTPException(status_code=422, detail="from_month must be before or equal to to_month.")
     carrier_clause = "AND Marketing_Airline_Network = ?" if carrier_value else ""
     t100_clause = "WHERE UniqueCarrier = ?" if carrier_value else ""
+    scope_clauses = []
+    scope_params: list = []
+    if origin_value:
+        scope_clauses.append("Origin = ?")
+        scope_params.append(origin_value)
+    if dest_value:
+        scope_clauses.append("Dest = ?")
+        scope_params.append(dest_value)
+    if from_month_key:
+        scope_clauses.append("Year * 100 + Month >= ?")
+        scope_params.append(from_month_key)
+    if to_month_key:
+        scope_clauses.append("Year * 100 + Month <= ?")
+        scope_params.append(to_month_key)
+    scope_where = f"WHERE {' AND '.join(scope_clauses)}" if scope_clauses else ""
 
     with open_readonly_connection() as connection:
         exists = connection.execute(
@@ -3638,6 +4390,8 @@ def capacity_trend(
                 SELECT
                     t.Year,
                     t.Month,
+                    t.Origin,
+                    t.Dest,
                     t.passengers,
                     t.seats_available,
                     t.departures_performed,
@@ -3666,13 +4420,14 @@ def capacity_trend(
                 SUM(departures_performed) AS departures_performed,
                 SUM(delay_total) AS delay_total
             FROM matched
+            {scope_where}
             GROUP BY Year, Month
             ORDER BY Year, Month
         """
         params = [carrier_value, minimum_flights] if carrier_value else [minimum_flights]
         if carrier_value:
             params.append(carrier_value)
-        rows = connection.execute(query, params).fetchall()
+        rows = connection.execute(query, [*params, *scope_params]).fetchall()
 
     months = []
     for row in rows:
@@ -3697,7 +4452,7 @@ def capacity_trend(
         "status": "ok" if months else "no_matching_months",
         "source": "BTS T-100 Domestic Segment + BTS Marketing Carrier On-Time Performance",
         "grain": "monthly totals of matched carrier + route + month observations",
-        "filters": {"carrier": carrier_value, "minimum_otp_flights": minimum_flights},
+        "filters": {"carrier": carrier_value, "origin": origin_value, "dest": dest_value, "from_month": from_month, "to_month": to_month, "minimum_otp_flights": minimum_flights},
         "months": months,
         "methodology": {
             "interpretation": "Monthly totals show how traffic context and on-time performance moved together over time; they do not establish that one caused the other.",
